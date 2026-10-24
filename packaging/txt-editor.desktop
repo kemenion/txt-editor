@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=txt-editor
+GenericName=Text Editor
+Comment=Fast, minimal text editor for KDE/Linux
+Exec=txt-editor %F
+Icon=txt-editor
+Terminal=false
+Categories=Utility;TextEditor;Development;
+MimeType=text/plain;text/markdown;text/x-python;text/x-csrc;text/x-c++src;application/json;application/xml;text/x-yaml;application/x-shellscript;
+Keywords=text;editor;code;notepad;
+StartupNotify=true
+StartupWMClass=txt-editor

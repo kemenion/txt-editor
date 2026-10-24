@@ -1,0 +1,11 @@
+Package: txt-editor
+Version: 0.1.0
+Section: editors
+Priority: optional
+Architecture: amd64
+Maintainer: kemenion <dev@kemenion.local>
+Depends: libc6 (>= 2.38), libstdc++6, libgcc-s1, libgtk-3-0t64 | libgtk-3-0, libglib2.0-0t64 | libglib2.0-0, libpango-1.0-0, libcairo2, libgdk-pixbuf-2.0-0, libatk1.0-0t64 | libatk1.0-0, libepoxy0, libfontconfig1, zlib1g, libexpat1, libpng16-16t64 | libpng16-16
+Description: minimal, fast Linux text editor
+ txt-editor is a small GUI text/code editor built with C++20, wxWidgets
+ and Scintilla/Lexilla. It supports UTF-8/UTF-16/ISO-8859-1, LF/CRLF/CR,
+ syntax highlighting, tabs, find/replace and atomic saves.
