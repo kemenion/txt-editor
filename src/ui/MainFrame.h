@@ -62,6 +62,7 @@ private:
     void UpdateTitle();
     void UpdateStatus();
     void ApplyTheme();
+    void ApplyWordWrap();
     void FindNext(bool forward);
     void ReplaceOne();
     void ReplaceAll();
@@ -87,6 +88,7 @@ private:
     void OnReplaceOne(wxCommandEvent& event);
     void OnReplaceAll(wxCommandEvent& event);
     void OnToggleTheme(wxCommandEvent& event);
+    void OnToggleWordWrap(wxCommandEvent& event);
     void OnZoomIn(wxCommandEvent& event);
     void OnZoomOut(wxCommandEvent& event);
     void OnZoomReset(wxCommandEvent& event);
@@ -99,11 +101,13 @@ private:
     FindPanel* m_findPanel = nullptr;
     wxFileHistory* m_fileHistory = nullptr;
     wxMenuItem* m_themeItem = nullptr;
+    wxMenuItem* m_wrapItem = nullptr;
     std::vector<EditorWidget*> m_pages;
     std::vector<TabState> m_tabStates;
     std::string m_sessionDirectory;
     bool m_suppressPageChanged = false;
     bool m_dark = false;
+    bool m_wordWrap = false;
 };
 
 }  // namespace txt

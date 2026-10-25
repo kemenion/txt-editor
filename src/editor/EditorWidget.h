@@ -39,6 +39,8 @@ public:
     void ApplyLargeFileMode(bool large);
     void SetDarkMode(bool dark);
     bool IsDarkMode() const { return m_dark; }
+    void SetWordWrap(bool wrap);
+    bool IsWordWrap() const { return m_wordWrap; }
 
     bool FindNext(const wxString& needle, bool matchCase, bool wholeWord, bool forward);
     bool ReplaceCurrent(const wxString& needle, const wxString& replacement,
@@ -64,6 +66,7 @@ private:
     std::string m_path;
     DocumentMeta m_meta;
     bool m_dark = false;
+    bool m_wordWrap = false;
     bool m_loading = false;
     bool m_forceModified = false;
 };

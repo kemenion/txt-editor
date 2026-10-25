@@ -277,6 +277,20 @@ void EditorWidget::SetDarkMode(bool dark) {
     ApplyPalette();
 }
 
+void EditorWidget::SetWordWrap(bool wrap) {
+    m_wordWrap = wrap;
+
+    // Wrap at word boundaries; Scintilla falls back to character wrapping for
+    // unbreakable runs (for example CJK text without spaces).  Continuation
+    // rows align with the start of the logical line so prose keeps a clean
+    // left edge while indented code stays readable.  The horizontal scrollbar
+    // is hidden because wrapped text never needs one.  Wrapping only affects
+    // display rows: line numbers and the document itself stay unchanged.
+    SetWrapMode(wrap ? wxSTC_WRAP_WORD : wxSTC_WRAP_NONE);
+    SetWrapIndentMode(wxSTC_WRAPINDENT_SAME);
+    SetUseHorizontalScrollBar(!wrap);
+}
+
 void EditorWidget::LoadText(const std::string& utf8, const DocumentMeta& meta) {
     m_loading = true;
     m_forceModified = false;

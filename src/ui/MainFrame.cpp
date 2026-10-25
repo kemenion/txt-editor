@@ -31,6 +31,7 @@ enum : int {
     ID_FIND_NEXT = wxID_HIGHEST + 200,
     ID_FIND_PREV,
     ID_TOGGLE_THEME,
+    ID_TOGGLE_WORD_WRAP,
     ID_ZOOM_IN,
     ID_ZOOM_OUT,
     ID_ZOOM_RESET,
@@ -65,8 +66,10 @@ MainFrame::MainFrame()
 
     wxConfigBase* config = wxConfigBase::Get();
     m_dark = config != nullptr && config->ReadBool("/view/dark", false);
+    m_wordWrap = config != nullptr && config->ReadBool("/view/wordWrap", false);
     m_notebook->SetDarkMode(m_dark);
     if (m_themeItem) m_themeItem->Check(m_dark);
+    if (m_wrapItem) m_wrapItem->Check(m_wordWrap);
     if (m_fileHistory && config) m_fileHistory->Load(*config);
     m_sessionDirectory = DefaultSessionDirectory();
 
@@ -87,6 +90,7 @@ MainFrame::MainFrame()
     Bind(wxEVT_MENU, &MainFrame::OnFindNext, this, ID_FIND_NEXT);
     Bind(wxEVT_MENU, &MainFrame::OnFindPrev, this, ID_FIND_PREV);
     Bind(wxEVT_MENU, &MainFrame::OnToggleTheme, this, ID_TOGGLE_THEME);
+    Bind(wxEVT_MENU, &MainFrame::OnToggleWordWrap, this, ID_TOGGLE_WORD_WRAP);
     Bind(wxEVT_MENU, &MainFrame::OnZoomIn, this, ID_ZOOM_IN);
     Bind(wxEVT_MENU, &MainFrame::OnZoomOut, this, ID_ZOOM_OUT);
     Bind(wxEVT_MENU, &MainFrame::OnZoomReset, this, ID_ZOOM_RESET);
@@ -151,6 +155,8 @@ void MainFrame::BuildMenu() {
     view->Append(ID_ZOOM_IN, "Zoom &In\tCtrl++");
     view->Append(ID_ZOOM_OUT, "Zoom &Out\tCtrl+-");
     view->Append(ID_ZOOM_RESET, "&Reset Zoom\tCtrl+0");
+    view->AppendSeparator();
+    m_wrapItem = view->AppendCheckItem(ID_TOGGLE_WORD_WRAP, "&Word Wrap\tAlt+Z");
     view->AppendSeparator();
     m_themeItem = view->AppendCheckItem(ID_TOGGLE_THEME, "&Dark Mode\tF11");
     bar->Append(view, "&View");
@@ -227,6 +233,7 @@ void MainFrame::CreatePage(const std::string& utf8, const DocumentMeta& meta,
 
     auto* editor = new EditorWidget(m_notebook->PageParent());
     editor->SetDarkMode(m_dark);
+    editor->SetWordWrap(m_wordWrap);
     editor->SetPath(path);
     editor->LoadText(utf8, meta);
 
@@ -419,6 +426,7 @@ void MainFrame::RestoreSession() {
     for (const SessionTabInfo& tab : result.session.tabs) {
         auto* editor = new EditorWidget(m_notebook->PageParent());
         editor->SetDarkMode(m_dark);
+        editor->SetWordWrap(m_wordWrap);
         editor->SetPath(tab.path);
         editor->SetMeta(tab.meta);
 
@@ -507,6 +515,15 @@ void MainFrame::ApplyTheme() {
     if (m_themeItem) m_themeItem->Check(m_dark);
     if (wxConfigBase* config = wxConfigBase::Get()) {
         config->Write("/view/dark", m_dark);
+        config->Flush();
+    }
+}
+
+void MainFrame::ApplyWordWrap() {
+    for (EditorWidget* editor : m_pages) editor->SetWordWrap(m_wordWrap);
+    if (m_wrapItem) m_wrapItem->Check(m_wordWrap);
+    if (wxConfigBase* config = wxConfigBase::Get()) {
+        config->Write("/view/wordWrap", m_wordWrap);
         config->Flush();
     }
 }
@@ -795,6 +812,12 @@ void MainFrame::OnToggleTheme(wxCommandEvent& event) {
     (void)event;
     m_dark = !m_dark;
     ApplyTheme();
+}
+
+void MainFrame::OnToggleWordWrap(wxCommandEvent& event) {
+    (void)event;
+    m_wordWrap = !m_wordWrap;
+    ApplyWordWrap();
 }
 
 void MainFrame::OnZoomIn(wxCommandEvent& event) {
