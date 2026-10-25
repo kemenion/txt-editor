@@ -110,6 +110,8 @@ WX_FLAGS=(
     -DwxUSE_SPELLCHECK=OFF
     -DwxUSE_OPENGL=OFF
     -DwxUSE_LIBLZMA=OFF
+    # Without wxUSE_INTL, wxConvLocal is ISO-8859-1; src/app/main.cpp therefore
+    # decodes the command line itself before calling wxEntry().
     -DwxUSE_INTL=OFF
     -DwxUSE_XRC=OFF
     -DwxUSE_RIBBON=OFF

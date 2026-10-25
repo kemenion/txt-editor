@@ -101,6 +101,31 @@ void TestDocumentRoundTrip() {
 }
 
 
+void TestNonAsciiPath() {
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::temp_directory_path() / "txt-editor-tests";
+    fs::create_directories(dir);
+    const fs::path path = dir / "中文 测试.txt";
+
+    {
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        out << "non-ascii path\n";
+    }
+
+    const txt::LoadResult loaded = txt::LoadDocument(path.string());
+    CHECK(loaded.ok);
+    CHECK(loaded.utf8 == "non-ascii path\n");
+    CHECK(loaded.meta.language == txt::LanguageId::Plain);
+
+    std::string error;
+    CHECK(txt::SaveDocument(path.string(), loaded.utf8, loaded.meta, &error));
+    CHECK(txt::LoadDocument(path.string()).ok);
+
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+}
+
+
 void TestSessionRoundTrip() {
     namespace fs = std::filesystem;
     const fs::path dir = fs::temp_directory_path() / "txt-editor-session-tests";
@@ -260,6 +285,7 @@ int main() {
     TestEol();
     TestLanguage();
     TestDocumentRoundTrip();
+    TestNonAsciiPath();
     TestSessionRoundTrip();
     TestSessionCorruption();
     if (g_failures == 0) {
