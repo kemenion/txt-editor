@@ -5,14 +5,17 @@
 
 #include <wx/frame.h>
 
+#include "ui/CompareTypes.h"
 #include "ui/TabBook.h"
 
 class wxFileHistory;
 class wxMenuItem;
+class wxUpdateUIEvent;
 
 namespace txt {
 
 struct DocumentMeta;
+class CompareFrame;
 class EditorWidget;
 class FindPanel;
 
@@ -67,6 +70,11 @@ private:
     void ReplaceOne();
     void ReplaceAll();
 
+    bool MakeCompareDocument(int index, CompareDocument* document, std::string* error);
+    std::vector<CompareDocument> CollectCompareDocuments(
+        const std::vector<std::string>& ids, const std::string& baseId,
+        std::vector<std::string>* skipped);
+
     void OnNew(wxCommandEvent& event);
     void OnOpen(wxCommandEvent& event);
     void OnSave(wxCommandEvent& event);
@@ -94,11 +102,15 @@ private:
     void OnZoomReset(wxCommandEvent& event);
     void OnRecent(wxCommandEvent& event);
     void OnAbout(wxCommandEvent& event);
+    void OnCompareTabs(wxCommandEvent& event);
+    void OnUpdateCompareMenu(wxUpdateUIEvent& event);
+    void OnCompareRefresh(wxCommandEvent& event);
     void OnPageChanged(wxBookCtrlEvent& event);
     void OnClose(wxCloseEvent& event);
 
     TabBook* m_notebook = nullptr;
     FindPanel* m_findPanel = nullptr;
+    CompareFrame* m_compareFrame = nullptr;
     wxFileHistory* m_fileHistory = nullptr;
     wxMenuItem* m_themeItem = nullptr;
     wxMenuItem* m_wrapItem = nullptr;

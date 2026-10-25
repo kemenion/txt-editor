@@ -17,6 +17,8 @@ second target from the same codebase.
 - LF / CRLF / CR detection and preservation.
 - Syntax highlighting for Python, C/C++, JSON, Markdown, shell, XML, YAML and plain text.
 - Find / replace with match-case and whole-word options.
+- Compare tabs in a separate read-only window: two panes side by side, or a grid for extra
+  tabs, with line-level change highlighting and synchronized scrolling.
 - Large-file mode above 32 MiB: no lexer, no folding, no undo collection.
 - Dark/light editor palette, zoom.
 - AppImage and `.deb` packaging scripts.
@@ -64,6 +66,8 @@ KDE Plasma desktops that use GTK-based apps). See [docs/BUILD.md](docs/BUILD.md)
 | Find | `Ctrl+F` |
 | Replace | `Ctrl+H` |
 | Find next / previous | `F3` / `Shift+F3` |
+| Compare tabs | `Ctrl+Shift+C` |
+| Refresh comparison | `F5` (in the comparison window) |
 | Zoom in / out / reset | `Ctrl++` / `Ctrl+-` / `Ctrl+0` |
 | Toggle editor palette | `F11` |
 
@@ -71,9 +75,9 @@ KDE Plasma desktops that use GTK-based apps). See [docs/BUILD.md](docs/BUILD.md)
 
 ```
 src/app/      wxApp, command line, profiling marks
-src/ui/       MainFrame, TabBook, SaveChangesDialog, FindPanel, menus
+src/ui/       MainFrame, TabBook, SaveChangesDialog, FindPanel, CompareFrame, DiffPane
 src/editor/   EditorWidget: wxStyledTextCtrl adapter, lexer/theme
-src/core/     pure C++20: encoding, EOL, language detection, file I/O
+src/core/     pure C++20: encoding, EOL, language detection, diff, file I/O
 tests/        framework-free core tests
 scripts/      bootstrap, build, test, package, benchmark
 docs/         architecture, build, performance

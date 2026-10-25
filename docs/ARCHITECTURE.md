@@ -19,11 +19,11 @@ the October 2026 wxGTK IME pre-edit fix. wx 3.2.x is explicitly unsupported.
 ┌──────────────────────────────────────────────────────────────┐
 │ app/       wxApp, command line, process lifetime             │
 ├──────────────────────────────────────────────────────────────┤
-│ ui/        MainFrame · FindPanel · menus · status bar        │
+│ ui/        MainFrame · FindPanel · CompareFrame · menus      │
 ├──────────────────────────────────────────────────────────────┤
 │ editor/    EditorWidget (wxStyledTextCtrl adapter)           │
 ├──────────────────────────────────────────────────────────────┤
-│ core/      encoding · EOL · language · file I/O (pure C++)   │
+│ core/      encoding · EOL · language · diff · file I/O       │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -210,6 +210,34 @@ icon and standard button placement; Cancel is the escape path and Save is the de
 named file. Save failures keep the tab open. A failed snapshot load is shown in the status bar
 and blocks saving that tab rather than writing an empty buffer over the file; closing that tab
 offers an explicit Discard Changes / Cancel warning instead.
+
+### Compare tabs
+
+`Compare` → `Compare Tabs...` (`Ctrl+Shift+C`) opens a separate top-level `CompareFrame`.
+`MainFrame` collects a snapshot of each selected tab: document id, title/path, UTF-8 text,
+`DocumentMeta`, zoom and first visible line. The first snapshot is the base; every other pane is
+compared against it. Snapshots are read-only, so the editor tabs remain editable while the
+comparison window is open.
+
+The comparison is deliberately not live. Edits, saves, new tabs and tab closes call
+`CompareFrame::MarkStale()`; the status bar asks for Refresh (`F5`), which re-collects the same
+document ids and rebuilds the panes. Tabs that have disappeared are dropped; if fewer than two
+remain, the comparison window closes with an explanation.
+
+Line alignment lives in `core/Diff.*` and has no wxWidgets dependency. `SplitLines` accepts LF,
+CRLF and lone CR. `AlignToBase` uses Myers diff with prefix/suffix trimming, bounded to 2,000 edit
+steps and 50,000 lines per side. Exceeding either bound produces a proportional line mapping with
+`Alignment::limited = true`, which suppresses highlight markers rather than showing misleading
+ones. Otherwise a change block pairs removed and added lines as `Modified` and leaves the rest as
+`Added`/`Removed`; `baseToPane`/`paneToBase` stay monotonic for scrolling.
+
+Each `DiffPane` is an `EditorWidget` in read-only mode with a title/meta/stats header.
+`wxSTC_MARK_BACKGROUND` markers in a zero-width symbol margin colour added, removed and modified
+lines without disturbing the line-number margin. `CompareFrame` creates a `wxSplitterWindow` for
+two panes and a flex grid for more. Scroll sync listens to `wxEVT_STC_UPDATEUI`: "Diff anchors"
+maps the top line through the active pane's alignment, while "Line numbers" keeps identical line
+indices. Programmatic scrolls are recorded in `m_expectedTop` so they are not echoed back as user
+scrolls. `F11` dark-mode changes are propagated with `SetDarkMode`.
 
 ## 6. Startup and threading
 

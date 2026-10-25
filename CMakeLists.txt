@@ -39,6 +39,7 @@ endforeach()
 
 
 add_library(txt_core STATIC
+    src/core/Diff.cpp
     src/core/Document.cpp
     src/core/Encoding.cpp
     src/core/Language.cpp
@@ -49,6 +50,8 @@ target_include_directories(txt_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
 add_library(txt_editor_lib STATIC
     src/app/Profile.cpp
     src/editor/EditorWidget.cpp
+    src/ui/CompareFrame.cpp
+    src/ui/DiffPane.cpp
     src/ui/FindPanel.cpp
     src/ui/MainFrame.cpp
     src/ui/SaveChangesDialog.cpp

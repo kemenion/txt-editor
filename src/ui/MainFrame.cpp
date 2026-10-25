@@ -5,7 +5,9 @@
 #include <string>
 #include <utility>
 
+#include <wx/choicdlg.h>
 #include <wx/config.h>
+#include <wx/event.h>
 #include <wx/filehistory.h>
 #include <wx/filedlg.h>
 #include <wx/filename.h>
@@ -21,6 +23,7 @@
 #include "core/Session.h"
 #include "core/TextTypes.h"
 #include "editor/EditorWidget.h"
+#include "ui/CompareFrame.h"
 #include "ui/FindPanel.h"
 #include "ui/SaveChangesDialog.h"
 
@@ -35,6 +38,7 @@ enum : int {
     ID_ZOOM_IN,
     ID_ZOOM_OUT,
     ID_ZOOM_RESET,
+    ID_COMPARE_TABS,
 };
 
 wxString FileNameOf(const std::string& path) {
@@ -94,6 +98,8 @@ MainFrame::MainFrame()
     Bind(wxEVT_MENU, &MainFrame::OnZoomIn, this, ID_ZOOM_IN);
     Bind(wxEVT_MENU, &MainFrame::OnZoomOut, this, ID_ZOOM_OUT);
     Bind(wxEVT_MENU, &MainFrame::OnZoomReset, this, ID_ZOOM_RESET);
+    Bind(wxEVT_MENU, &MainFrame::OnCompareTabs, this, ID_COMPARE_TABS);
+    Bind(wxEVT_UPDATE_UI, &MainFrame::OnUpdateCompareMenu, this, ID_COMPARE_TABS);
     Bind(wxEVT_MENU, &MainFrame::OnAbout, this, wxID_ABOUT);
     Bind(wxEVT_MENU, &MainFrame::OnRecent, this, wxID_FILE1, wxID_FILE9);
 
@@ -131,7 +137,6 @@ void MainFrame::BuildMenu() {
     file->Append(wxID_SAVEAS, "Save &As...\tCtrl+Shift+S");
     file->AppendSeparator();
     m_fileHistory->UseMenu(file);
-    file->AppendSeparator();
     file->Append(wxID_CLOSE, "&Close Tab\tCtrl+W");
     file->Append(wxID_EXIT, "&Quit\tCtrl+Q");
     bar->Append(file, "&File");
@@ -161,6 +166,10 @@ void MainFrame::BuildMenu() {
     m_themeItem = view->AppendCheckItem(ID_TOGGLE_THEME, "&Dark Mode\tF11");
     bar->Append(view, "&View");
 
+    auto* compare = new wxMenu;
+    compare->Append(ID_COMPARE_TABS, "Compare &Tabs...\tCtrl+Shift+C");
+    bar->Append(compare, "&Compare");
+
     auto* help = new wxMenu;
     help->Append(wxID_ABOUT, "&About txt-editor");
     bar->Append(help, "&Help");
@@ -176,6 +185,7 @@ void MainFrame::BindEditor(EditorWidget* editor) {
     editor->Bind(wxEVT_STC_MODIFIED, [this, editor](wxStyledTextEvent& event) {
         RefreshTab(editor);
         if (editor == CurrentEditor()) UpdateTitle();
+        if (m_compareFrame != nullptr) m_compareFrame->MarkStale();
         event.Skip();
     });
 }
@@ -208,6 +218,7 @@ void MainFrame::AppendPage(EditorWidget* editor, const wxString& title, TabState
     m_tabStates.push_back(std::move(state));
     BindEditor(editor);
     m_suppressPageChanged = previous;
+    if (m_compareFrame != nullptr) m_compareFrame->MarkStale();
 }
 
 void MainFrame::DeletePage(int index) {
@@ -218,6 +229,7 @@ void MainFrame::DeletePage(int index) {
     m_pages.erase(m_pages.begin() + index);
     m_tabStates.erase(m_tabStates.begin() + index);
     m_suppressPageChanged = previous;
+    if (m_compareFrame != nullptr) m_compareFrame->MarkStale();
 }
 
 void MainFrame::CreatePage(const std::string& utf8, const DocumentMeta& meta,
@@ -512,6 +524,7 @@ void MainFrame::UpdateStatus() {
 void MainFrame::ApplyTheme() {
     for (EditorWidget* editor : m_pages) editor->SetDarkMode(m_dark);
     m_notebook->SetDarkMode(m_dark);
+    if (m_compareFrame != nullptr) m_compareFrame->SetDarkMode(m_dark);
     if (m_themeItem) m_themeItem->Check(m_dark);
     if (wxConfigBase* config = wxConfigBase::Get()) {
         config->Write("/view/dark", m_dark);
@@ -620,6 +633,7 @@ bool MainFrame::SaveCurrent(bool saveAs) {
     RefreshTab(editor);
     UpdateTitle();
     UpdateStatus();
+    if (m_compareFrame != nullptr) m_compareFrame->MarkStale();
     return true;
 }
 
@@ -852,6 +866,238 @@ void MainFrame::OnAbout(wxCommandEvent& event) {
     wxMessageBox(text, "About txt-editor", wxOK | wxICON_INFORMATION, this);
 }
 
+bool MainFrame::MakeCompareDocument(int index, CompareDocument* document,
+                                    std::string* error) {
+    if (document == nullptr) return false;
+    TabState* state = StateAt(index);
+    if (state == nullptr || index < 0 || index >= static_cast<int>(m_pages.size())) {
+        if (error) *error = "The tab no longer exists.";
+        return false;
+    }
+
+    if (!EnsureTabLoaded(index)) {
+        if (error) {
+            *error = state->loadError.empty() ? "The tab could not be loaded."
+                                              : state->loadError;
+        }
+        return false;
+    }
+    if (state->id.empty()) state->id = MakeSessionId();
+
+    EditorWidget* editor = m_pages[static_cast<std::size_t>(index)];
+    document->id = state->id;
+    document->title = FileNameOf(editor->Path()).utf8_string();
+    document->path = editor->Path();
+    document->text = editor->GetUtf8();
+    document->meta = editor->Meta();
+    document->zoom = editor->GetZoom();
+    document->firstVisibleLine = editor->FirstVisibleLine();
+    document->modified = editor->IsModified();
+    return true;
+}
+
+std::vector<CompareDocument> MainFrame::CollectCompareDocuments(
+    const std::vector<std::string>& ids, const std::string& baseId,
+    std::vector<std::string>* skipped) {
+    std::vector<CompareDocument> documents;
+    documents.reserve(ids.size());
+
+    for (const std::string& id : ids) {
+        if (id.empty()) continue;
+        int index = -1;
+        for (std::size_t i = 0; i < m_tabStates.size(); ++i) {
+            if (m_tabStates[i].id == id) {
+                index = static_cast<int>(i);
+                break;
+            }
+        }
+        if (index < 0) {
+            if (skipped != nullptr) skipped->push_back("Tab is no longer open.");
+            continue;
+        }
+
+        CompareDocument document;
+        std::string error;
+        if (!MakeCompareDocument(index, &document, &error)) {
+            if (skipped != nullptr) {
+                const wxString name =
+                    FileNameOf(m_pages[static_cast<std::size_t>(index)]->Path());
+                skipped->push_back(name.utf8_string() + ": " + error);
+            }
+            continue;
+        }
+        documents.push_back(std::move(document));
+    }
+
+    const auto base = std::find_if(
+        documents.begin(), documents.end(),
+        [&baseId](const CompareDocument& document) { return document.id == baseId; });
+    if (base != documents.end()) std::rotate(documents.begin(), base, documents.end());
+    return documents;
+}
+
+void MainFrame::OnCompareTabs(wxCommandEvent& event) {
+    (void)event;
+    if (m_pages.size() < 2) {
+        wxMessageBox("Compare Tabs needs at least two open tabs.", "Compare Tabs",
+                     wxOK | wxICON_INFORMATION, this);
+        return;
+    }
+
+    const int current = m_notebook->GetSelection();
+    std::vector<int> candidates;
+    std::vector<std::string> skipped;
+    for (std::size_t i = 0; i < m_pages.size(); ++i) {
+        const int index = static_cast<int>(i);
+        if (EnsureTabLoaded(index)) {
+            candidates.push_back(index);
+        } else {
+            const wxString name = FileNameOf(m_pages[i]->Path());
+            const TabState* state = StateAt(index);
+            skipped.push_back(name.utf8_string() + ": " +
+                              (state == nullptr ? std::string("not loaded")
+                                                : state->loadError));
+        }
+    }
+
+    if (candidates.size() < 2) {
+        wxString detail = "At least two tabs must be loadable to compare.";
+        if (!skipped.empty()) {
+            detail += "\n\nSkipped tabs:";
+            for (const std::string& item : skipped) {
+                detail += "\n" + wxString::FromUTF8(item);
+            }
+        }
+        wxMessageBox(detail, "Compare Tabs", wxOK | wxICON_WARNING, this);
+        return;
+    }
+
+    std::vector<int> picked;
+    if (candidates.size() == 2) {
+        picked = candidates;
+    } else {
+        wxArrayString choices;
+        for (std::size_t i = 0; i < candidates.size(); ++i) {
+            const int index = candidates[i];
+            wxString label = FileNameOf(m_pages[static_cast<std::size_t>(index)]->Path());
+            if (m_pages[static_cast<std::size_t>(index)]->IsModified()) label += " *";
+            choices.Add(label);
+        }
+
+        wxMultiChoiceDialog dialog(
+            this, "Choose the tabs to compare against the current tab:", "Compare Tabs",
+            choices);
+        wxArrayInt defaults;
+        for (std::size_t i = 0; i < candidates.size(); ++i) {
+            defaults.Add(static_cast<int>(i));
+        }
+        dialog.SetSelections(defaults);
+        if (dialog.ShowModal() != wxID_OK) return;
+
+        const wxArrayInt selections = dialog.GetSelections();
+        for (std::size_t i = 0; i < selections.size(); ++i) {
+            const int choice = selections[i];
+            if (choice < 0 || choice >= static_cast<int>(candidates.size())) continue;
+            picked.push_back(candidates[static_cast<std::size_t>(choice)]);
+        }
+    }
+
+    if (picked.size() < 2) {
+        wxMessageBox("Select at least two tabs to compare.", "Compare Tabs",
+                     wxOK | wxICON_INFORMATION, this);
+        return;
+    }
+
+    int baseIndex = picked.front();
+    if (current >= 0 &&
+        std::find(picked.begin(), picked.end(), current) != picked.end()) {
+        baseIndex = current;
+    }
+
+    std::vector<std::string> ids;
+    auto idAt = [this](int index) {
+        TabState* state = StateAt(index);
+        if (state == nullptr) return std::string();
+        if (state->id.empty()) state->id = MakeSessionId();
+        return state->id;
+    };
+    ids.push_back(idAt(baseIndex));
+    for (int index : picked) {
+        if (index != baseIndex) ids.push_back(idAt(index));
+    }
+
+    std::vector<std::string> refreshSkipped;
+    std::vector<CompareDocument> documents =
+        CollectCompareDocuments(ids, ids.front(), &refreshSkipped);
+    skipped.insert(skipped.end(), refreshSkipped.begin(), refreshSkipped.end());
+
+    if (documents.size() < 2) {
+        wxString detail = "At least two selected tabs could not be read.";
+        if (!skipped.empty()) {
+            detail += "\n\nSkipped tabs:";
+            for (const std::string& item : skipped) {
+                detail += "\n" + wxString::FromUTF8(item);
+            }
+        }
+        wxMessageBox(detail, "Compare Tabs", wxOK | wxICON_WARNING, this);
+        return;
+    }
+
+    if (!skipped.empty()) {
+        wxString detail = "Some tabs were not included in the comparison:";
+        for (const std::string& item : skipped) {
+            detail += "\n" + wxString::FromUTF8(item);
+        }
+        wxMessageBox(detail, "Compare Tabs", wxOK | wxICON_WARNING, this);
+    }
+
+    if (m_compareFrame == nullptr) {
+        m_compareFrame = new CompareFrame(this, std::move(documents), m_dark);
+        m_compareFrame->Bind(EVT_COMPARE_REFRESH, &MainFrame::OnCompareRefresh, this);
+        m_compareFrame->Bind(wxEVT_CLOSE_WINDOW, [this](wxCloseEvent& closeEvent) {
+            m_compareFrame = nullptr;
+            closeEvent.Skip();
+        });
+        m_compareFrame->Show();
+    } else {
+        if (!m_compareFrame->SetDocuments(std::move(documents))) {
+            wxMessageBox("The comparison could not be updated.", "Compare Tabs",
+                         wxOK | wxICON_ERROR, this);
+            return;
+        }
+        m_compareFrame->Raise();
+        m_compareFrame->Show();
+    }
+}
+
+void MainFrame::OnUpdateCompareMenu(wxUpdateUIEvent& event) {
+    event.Enable(m_pages.size() >= 2);
+}
+
+void MainFrame::OnCompareRefresh(wxCommandEvent& event) {
+    (void)event;
+    if (m_compareFrame == nullptr) return;
+
+    const std::vector<std::string> ids = m_compareFrame->DocumentIds();
+    const std::string baseId = m_compareFrame->BaseId();
+    std::vector<std::string> skipped;
+    std::vector<CompareDocument> documents =
+        CollectCompareDocuments(ids, baseId, &skipped);
+
+    if (documents.size() < 2) {
+        wxMessageBox(
+            "The tabs being compared are no longer available. The comparison will close.",
+            "Compare Tabs", wxOK | wxICON_INFORMATION, m_compareFrame);
+        CompareFrame* frame = m_compareFrame;
+        m_compareFrame = nullptr;
+        frame->Destroy();
+        return;
+    }
+
+    m_compareFrame->SetDocuments(std::move(documents));
+    m_compareFrame->Raise();
+}
+
 void MainFrame::OnPageChanged(wxBookCtrlEvent& event) {
     if (!m_suppressPageChanged) {
         const int selection = event.GetSelection();
@@ -886,6 +1132,10 @@ void MainFrame::OnClose(wxCloseEvent& event) {
             m_fileHistory->Save(*config);
             config->Flush();
         }
+    }
+    if (m_compareFrame != nullptr) {
+        m_compareFrame->Destroy();
+        m_compareFrame = nullptr;
     }
     event.Skip();
 }
