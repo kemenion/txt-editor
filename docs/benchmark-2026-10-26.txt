@@ -1,0 +1,21 @@
+# Benchmark report — 2026-10-26
+
+- Machine: Linux 6.12.113+deb13-amd64 x86_64 (Debian GNU/Linux 13 (trixie))
+- Session: wayland
+- Compiler: g++ (Debian 14.2.0-19) 14.2.0
+- wxWidgets: 3.3.4
+- Repetitions: 10 startups, 3 file opens, RSS after 10 s idle
+- Definitions: cold = fork to `window shown` wall clock over all runs; warm = the same excluding run 1; open = in-process `load done - load begin`; RSS = VmRSS after the idle period.
+- Caveat: the page cache was not dropped (needs root), so startup values are optimistic. IME checks are manual; see docs/PERFORMANCE.md.
+
+| Cold start p50 | Cold start p95 | Warm p50 | 10 MB open | 100 MB open | Idle RSS |
+|---|---|---|---|---|---|
+| 66.8 ms | 86.3 ms | 66.8 ms | 17.6 ms | 164.2 ms | 112 MB |
+
+Budget check (docs/PERFORMANCE.md; the 100 MB file uses large-file mode):
+
+- cold start p95 86.3 ms <= 200 ms: OK
+- warm start p50 66.8 ms <= 80 ms: OK
+- 10 MB open 17.6 ms <= 300 ms: OK
+- 100 MB open 164.2 ms <= 1500 ms: OK
+- idle RSS 112 MB <= 60 MB: OVER BUDGET
