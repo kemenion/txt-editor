@@ -1,6 +1,7 @@
 #include "core/Session.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <charconv>
 #include <chrono>
@@ -8,6 +9,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <iterator>
 #include <optional>
 #include <random>
 #include <set>
@@ -21,7 +23,14 @@ namespace fs = std::filesystem;
 
 constexpr std::string_view kManifestName = "manifest";
 constexpr std::string_view kManifestHeader = "txt-editor-session 1";
+constexpr std::string_view kInstancesDirectory = "instances";
+constexpr std::string_view kOwnerName = "owner";
+constexpr std::string_view kOwnerHeader = "txt-editor-instance 1";
 constexpr std::size_t kMaxManifestBytes = 16u * 1024u * 1024u;
+constexpr std::size_t kMaxOwnerBytes = 4096;
+constexpr std::size_t kMaxMergedTabs = 200;
+constexpr std::size_t kCopyBufferBytes = 64u * 1024u;
+constexpr std::chrono::hours kTemporaryMaxAge{24};
 
 constexpr fs::perms kDirectoryPermissions = fs::perms::owner_all;
 constexpr fs::perms kFilePermissions =
@@ -197,6 +206,95 @@ bool SplitValue(std::string_view token, std::string_view key, std::string_view* 
     }
     *value = token.substr(key.size() + 1);
     return true;
+}
+
+// Temporary files are left behind when a process is killed between writing and
+// renaming; they are never referenced by a manifest.
+bool IsTemporaryName(std::string_view name) {
+    return name.find(".tmp-") != std::string_view::npos;
+}
+
+bool ParseLongLong(std::string_view text, long long* value) {
+    if (text.empty()) return false;
+    const char* begin = text.data();
+    const char* end = begin + text.size();
+    const auto result = std::from_chars(begin, end, *value);
+    return result.ec == std::errc() && result.ptr == end;
+}
+
+bool ParseOwner(std::string_view text, SessionOwner* owner) {
+    std::istringstream input{std::string(text)};
+    std::string line;
+    if (!std::getline(input, line)) return false;
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    if (line != kOwnerHeader) return false;
+
+    std::optional<long long> pid;
+    std::optional<std::string> hostHex;
+    std::optional<long long> sequence;
+    while (std::getline(input, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.empty()) continue;
+
+        const std::string_view view(line);
+        if (view.rfind("pid ", 0) == 0) {
+            long long parsed = 0;
+            if (!ParseLongLong(view.substr(4), &parsed)) return false;
+            pid = parsed;
+        } else if (view.rfind("host ", 0) == 0) {
+            hostHex = std::string(view.substr(5));
+        } else if (view.rfind("sequence ", 0) == 0) {
+            long long parsed = 0;
+            if (!ParseLongLong(view.substr(9), &parsed)) return false;
+            sequence = parsed;
+        } else {
+            return false;
+        }
+    }
+    if (!pid || !hostHex || !sequence || *pid < 0) return false;
+
+    std::string host;
+    if (!HexDecode(*hostHex, &host)) return false;
+    owner->pid = static_cast<long>(*pid);
+    owner->host = std::move(host);
+    owner->sequence = *sequence;
+    return true;
+}
+
+// A missing or malformed owner file is not an error: the instance is then
+// simply treated as dead, which is the safe direction for restore and pruning.
+bool LoadOwner(const fs::path& directory, SessionOwner* owner) {
+    *owner = SessionOwner{};
+    std::string text;
+    std::string error;
+    if (!ReadWholeFile(directory / std::string(kOwnerName), kMaxOwnerBytes, &text,
+                       &error)) {
+        return false;
+    }
+    return ParseOwner(text, owner);
+}
+
+void CleanTemporariesIn(const fs::path& directory, std::string* error) {
+    std::error_code ec;
+    fs::directory_iterator iterator(directory, ec);
+    if (ec) return;
+
+    const fs::file_time_type cutoff =
+        fs::file_time_type::clock::now() - kTemporaryMaxAge;
+    for (const fs::directory_entry& entry : iterator) {
+        std::error_code entryEc;
+        if (!entry.is_regular_file(entryEc) || entryEc) continue;
+        if (!IsTemporaryName(entry.path().filename().string())) continue;
+        // Young files may belong to a process that is writing right now.
+        const fs::file_time_type modified = entry.last_write_time(entryEc);
+        if (entryEc || modified > cutoff) continue;
+
+        std::error_code removeEc;
+        fs::remove(entry.path(), removeEc);
+        if (removeEc && error) {
+            *error = "Cannot remove a temporary session file: " + removeEc.message();
+        }
+    }
 }
 
 bool ValidEncoding(int value) {
@@ -636,6 +734,349 @@ bool ClearSession(const std::string& directory, std::string* error) {
         ec.clear();
     }
     return ok;
+}
+
+std::vector<SessionInstance> ListSessionInstances(const std::string& root) {
+    std::vector<SessionInstance> instances;
+    if (root.empty()) return instances;
+
+    const fs::path rootPath(root);
+    std::error_code ec;
+    if (fs::is_regular_file(rootPath / std::string(kManifestName), ec) && !ec) {
+        SessionInstance legacy;
+        legacy.directory = root;
+        legacy.legacy = true;
+        legacy.hasManifest = true;
+        instances.push_back(std::move(legacy));
+    }
+
+    std::vector<SessionInstance> found;
+    fs::directory_iterator iterator(rootPath / std::string(kInstancesDirectory), ec);
+    if (!ec) {
+        for (const fs::directory_entry& entry : iterator) {
+            std::error_code entryEc;
+            // A symlink would make the snapshot paths below point outside the
+            // session tree; only real directories are considered ours.
+            if (entry.is_symlink(entryEc) || entryEc) continue;
+            if (!entry.is_directory(entryEc) || entryEc) continue;
+            const std::string name = entry.path().filename().string();
+            if (!IsSafeId(name)) continue;
+
+            SessionInstance instance;
+            instance.directory = entry.path().string();
+            LoadOwner(entry.path(), &instance.owner);
+            std::error_code manifestEc;
+            instance.hasManifest = fs::is_regular_file(
+                                       entry.path() / std::string(kManifestName),
+                                       manifestEc) &&
+                                   !manifestEc;
+            found.push_back(std::move(instance));
+        }
+    }
+
+    std::sort(found.begin(), found.end(),
+              [](const SessionInstance& left, const SessionInstance& right) {
+                  if (left.owner.sequence != right.owner.sequence) {
+                      return left.owner.sequence < right.owner.sequence;
+                  }
+                  return left.directory < right.directory;
+              });
+    instances.insert(instances.end(), std::make_move_iterator(found.begin()),
+                     std::make_move_iterator(found.end()));
+    return instances;
+}
+
+bool CreateSessionInstance(const std::string& root, const SessionOwner& owner,
+                           std::string* directory, std::string* error) {
+    if (root.empty()) {
+        if (error) *error = "Session directory is not available.";
+        return false;
+    }
+
+    const fs::path instances = fs::path(root) / std::string(kInstancesDirectory);
+    // The root is restricted as well: instance names are harmless, but the
+    // documented invariant is an owner-only tree from the root down.
+    if (!EnsureDirectory(root, error)) return false;
+    if (!EnsureDirectory(instances.string(), error)) return false;
+
+    for (int attempt = 0; attempt < 4; ++attempt) {
+        const fs::path candidate = instances / MakeSessionId();
+        std::error_code ec;
+        if (!fs::create_directory(candidate, ec) || ec) continue;
+        if (!EnsureDirectory(candidate.string(), error)) return false;
+        if (!WriteSessionOwner(candidate.string(), owner, error)) return false;
+        if (directory) *directory = candidate.string();
+        return true;
+    }
+
+    if (error) *error = "Cannot create a session instance directory.";
+    return false;
+}
+
+bool WriteSessionOwner(const std::string& directory, const SessionOwner& owner,
+                       std::string* error) {
+    if (!EnsureDirectory(directory, error)) return false;
+
+    std::ostringstream out;
+    out << kOwnerHeader << '\n';
+    out << "pid " << owner.pid << '\n';
+    // The host name is hex encoded so an unexpected character cannot turn the
+    // owner file into an unparsable one.
+    out << "host " << HexEncode(owner.host) << '\n';
+    out << "sequence " << owner.sequence << '\n';
+    return WriteFileAtomic(fs::path(directory) / std::string(kOwnerName), out.str(),
+                           error);
+}
+
+MergedSession MergeSessions(const std::vector<std::string>& directories) {
+    MergedSession merged;
+    std::set<std::string> ids;
+    bool capped = false;
+
+    for (const std::string& directory : directories) {
+        if (capped) break;
+
+        const SessionLoadResult result = LoadSession(directory);
+        if (!result.found) continue;
+        if (!result.ok) {
+            merged.errors.push_back(directory + ": " + result.error);
+            continue;
+        }
+        merged.mergedDirectories.push_back(directory);
+
+        std::vector<int> slotOfTab(result.session.tabs.size(), -1);
+        for (std::size_t i = 0; i < result.session.tabs.size(); ++i) {
+            const SessionTabInfo& tab = result.session.tabs[i];
+            int slot = -1;
+            if (!tab.path.empty()) {
+                for (std::size_t existing = 0;
+                     existing < merged.session.tabs.size(); ++existing) {
+                    if (merged.session.tabs[existing].path == tab.path) {
+                        slot = static_cast<int>(existing);
+                        break;
+                    }
+                }
+            }
+            if (slot >= 0) {
+                SessionTabInfo& kept =
+                    merged.session.tabs[static_cast<std::size_t>(slot)];
+                slotOfTab[i] = slot;
+                if (tab.modified && !kept.modified) {
+                    // The newer session holds unsaved work for a file the older
+                    // one only had open; keep the position but take the content.
+                    kept = tab;
+                    merged.sourceDirectory[static_cast<std::size_t>(slot)] =
+                        directory;
+                    continue;
+                }
+                if (!tab.modified) continue;
+                // Both versions are modified: keep both instead of dropping
+                // unsaved work from either window.
+            }
+
+            if (merged.session.tabs.size() >= kMaxMergedTabs) {
+                capped = true;
+                break;
+            }
+            if (tab.id.empty() || !ids.insert(tab.id).second) {
+                merged.errors.push_back(directory + ": duplicate tab id " +
+                                        tab.id);
+                continue;
+            }
+            merged.session.tabs.push_back(tab);
+            merged.sourceDirectory.push_back(directory);
+            slotOfTab[i] = static_cast<int>(merged.session.tabs.size()) - 1;
+        }
+
+        // The most recent source decides which merged tab starts active.
+        const int active = result.session.active;
+        if (active >= 0 && active < static_cast<int>(slotOfTab.size()) &&
+            slotOfTab[static_cast<std::size_t>(active)] >= 0) {
+            merged.session.active = slotOfTab[static_cast<std::size_t>(active)];
+        }
+    }
+
+    if (capped) {
+        merged.errors.push_back("Too many tabs to restore; the rest was skipped.");
+    }
+    if (merged.session.tabs.empty()) merged.session.active = 0;
+    return merged;
+}
+
+bool CopySessionContent(const std::string& sourceDirectory,
+                        const std::string& contentFile,
+                        const std::string& targetDirectory, const std::string& id,
+                        std::string* newContentFile, std::string* error) {
+    if (sourceDirectory.empty() || targetDirectory.empty() || contentFile.empty()) {
+        if (error) *error = "Session content file is not available.";
+        return false;
+    }
+    if (!IsSafeId(id) || !IsContentFileFor(contentFile, id)) {
+        if (error) *error = "Session content file does not match its tab id.";
+        return false;
+    }
+    if (!EnsureDirectory(targetDirectory, error)) return false;
+
+    const std::string name = ContentName(id);
+    const fs::path source = fs::path(sourceDirectory) / contentFile;
+    const fs::path target = fs::path(targetDirectory) / name;
+    if (source == target) {
+        if (newContentFile) *newContentFile = name;
+        return true;
+    }
+
+    std::ifstream in(source, std::ios::binary);
+    if (!in) {
+        if (error) *error = "Cannot open session content: " + source.string();
+        return false;
+    }
+
+    const std::string temp = target.string() + TempSuffix();
+    std::ofstream out(temp, std::ios::binary | std::ios::trunc);
+    if (!out) {
+        if (error) *error = "Cannot create temporary session file: " + temp;
+        return false;
+    }
+
+    // Recovery buffers can be large, so the copy never holds a second full
+    // copy of the text in memory.
+    std::array<char, kCopyBufferBytes> buffer{};
+    bool failed = false;
+    while (in) {
+        in.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+        const std::streamsize read = in.gcount();
+        if (read <= 0) break;
+        out.write(buffer.data(), read);
+        if (!out) {
+            failed = true;
+            break;
+        }
+    }
+    if (!failed && !in.eof()) failed = true;
+
+    out.flush();
+    if (!out) failed = true;
+    out.close();
+    if (failed && error) *error = "Cannot copy session content: " + source.string();
+
+    if (!failed) {
+        std::error_code ec;
+        fs::permissions(temp, kFilePermissions, fs::perm_options::replace, ec);
+        fs::rename(temp, target, ec);
+        if (ec) {
+            if (error) {
+                *error = "Cannot replace session file: " + target.string() + " (" +
+                         ec.message() + ")";
+            }
+            failed = true;
+        }
+    }
+
+    if (failed) {
+        std::error_code ignored;
+        fs::remove(temp, ignored);
+        return false;
+    }
+
+    if (newContentFile) *newContentFile = name;
+    return true;
+}
+
+bool RemoveSessionInstance(const std::string& directory, std::string* error) {
+    if (directory.empty()) return true;
+
+    std::error_code ec;
+    if (!fs::exists(directory, ec)) return !ec;
+
+    bool ok = true;
+    fs::directory_iterator iterator(directory, ec);
+    if (ec) {
+        if (error) *error = "Cannot list session directory: " + ec.message();
+        return false;
+    }
+    for (const fs::directory_entry& entry : iterator) {
+        std::error_code entryEc;
+        if (!entry.is_regular_file(entryEc) || entryEc) {
+            entryEc.clear();
+            continue;
+        }
+        const std::string name = entry.path().filename().string();
+        if (name != kOwnerName && name != kManifestName && !IsSnapshotName(name) &&
+            !IsTemporaryName(name)) {
+            continue;
+        }
+        std::error_code removeEc;
+        fs::remove(entry.path(), removeEc);
+        if (removeEc) {
+            if (error) *error = "Cannot remove session file: " + removeEc.message();
+            ok = false;
+        }
+    }
+
+    fs::remove(directory, ec);
+    if (ec) {
+        // Unknown files may keep the directory alive; that is harmless.
+        ec.clear();
+    }
+    return ok;
+}
+
+bool RemoveLegacySession(const std::string& root, std::string* error) {
+    if (root.empty()) return true;
+
+    const fs::path rootPath(root);
+    std::error_code ec;
+    fs::remove(rootPath / std::string(kManifestName), ec);
+    if (ec) {
+        if (error) *error = "Cannot remove session manifest: " + ec.message();
+        return false;
+    }
+
+    fs::directory_iterator iterator(rootPath, ec);
+    if (ec) {
+        if (error) *error = "Cannot list session directory: " + ec.message();
+        return false;
+    }
+    bool ok = true;
+    for (const fs::directory_entry& entry : iterator) {
+        std::error_code entryEc;
+        if (!entry.is_regular_file(entryEc) || entryEc) {
+            entryEc.clear();
+            continue;
+        }
+        const std::string name = entry.path().filename().string();
+        // Only the layout that lived directly in the root is removed; the
+        // instances/ subdirectory and unrelated files are never touched.
+        if (!IsSnapshotName(name) && !IsTemporaryName(name)) continue;
+        std::error_code removeEc;
+        fs::remove(entry.path(), removeEc);
+        if (removeEc) {
+            if (error) *error = "Cannot remove session content: " + removeEc.message();
+            ok = false;
+        }
+    }
+    return ok;
+}
+
+bool CleanSessionTemporaries(const std::string& root, std::string* error) {
+    if (root.empty()) return true;
+
+    const fs::path rootPath(root);
+    std::error_code ec;
+    if (!fs::is_directory(rootPath, ec)) return !ec;
+
+    CleanTemporariesIn(rootPath, error);
+
+    fs::directory_iterator iterator(rootPath / std::string(kInstancesDirectory), ec);
+    if (!ec) {
+        for (const fs::directory_entry& entry : iterator) {
+            std::error_code entryEc;
+            if (entry.is_symlink(entryEc) || entryEc) continue;
+            if (!entry.is_directory(entryEc) || entryEc) continue;
+            CleanTemporariesIn(entry.path(), error);
+        }
+    }
+    return true;
 }
 
 }  // namespace txt

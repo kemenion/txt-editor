@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <filesystem>
 #include <string>
 #include <string_view>
 
@@ -37,6 +38,14 @@ struct DocumentMeta {
     Eol eol = Eol::Lf;
     LanguageId language = LanguageId::Plain;
     bool largeFile = false;
+};
+
+// Identity of a file on disk at load or save time. `valid` is false when the
+// file could not be inspected, in which case no conflict detection is possible.
+struct FileStamp {
+    std::uintmax_t size = 0;
+    std::filesystem::file_time_type modified{};
+    bool valid = false;
 };
 
 inline constexpr std::size_t kLargeFileThreshold = 32u * 1024u * 1024u;

@@ -50,11 +50,36 @@ LoadResult LoadDocument(const std::string& path) {
     result.meta.eol = DetectEol(result.utf8);
     result.meta.language = DetectLanguage(path, result.utf8);
     result.meta.largeFile = bytes.size() > kLargeFileThreshold;
+    // The stamp describes the file this buffer came from; a failure to read it
+    // only disables the external-modification check for this tab.
+    ReadFileStamp(path, &result.stamp);
     result.ok = true;
     if (!conversionOk) {
         result.error = "Malformed input; some bytes were replaced.";
     }
     return result;
+}
+
+bool ReadFileStamp(const std::string& path, FileStamp* stamp) {
+    if (stamp == nullptr) return false;
+    *stamp = FileStamp{};
+
+    std::error_code ec;
+    const std::uintmax_t size = std::filesystem::file_size(path, ec);
+    if (ec) return false;
+    const std::filesystem::file_time_type modified =
+        std::filesystem::last_write_time(path, ec);
+    if (ec) return false;
+
+    stamp->size = size;
+    stamp->modified = modified;
+    stamp->valid = true;
+    return true;
+}
+
+bool SameFileStamp(const FileStamp& left, const FileStamp& right) {
+    if (!left.valid || !right.valid) return false;
+    return left.size == right.size && left.modified == right.modified;
 }
 
 bool SaveDocument(const std::string& path, std::string_view utf8,

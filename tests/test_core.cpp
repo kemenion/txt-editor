@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -282,6 +283,365 @@ void TestSessionCorruption() {
 }
 
 
+void TestSessionInstanceList() {
+    namespace fs = std::filesystem;
+    const fs::path root = fs::temp_directory_path() / "txt-editor-session-instances";
+    std::error_code ec;
+    fs::remove_all(root, ec);
+
+    std::string error;
+    txt::SessionOwner owner;
+    owner.pid = 4242;
+    owner.host = "host-a";
+    owner.sequence = 100;
+    std::string first;
+    CHECK(txt::CreateSessionInstance(root.string(), owner, &first, &error));
+    CHECK(fs::is_directory(first));
+    CHECK(fs::path(first).parent_path() == root / "instances");
+    const fs::perms rootPermissions = fs::status(root).permissions();
+    CHECK((rootPermissions & fs::perms::group_read) == fs::perms::none);
+    CHECK((rootPermissions & fs::perms::others_read) == fs::perms::none);
+    const fs::perms instancePermissions = fs::status(first).permissions();
+    CHECK((instancePermissions & fs::perms::others_read) == fs::perms::none);
+
+    owner.pid = 4343;
+    owner.host = "host-b";
+    owner.sequence = 200;
+    std::string second;
+    CHECK(txt::CreateSessionInstance(root.string(), owner, &second, &error));
+    CHECK(first != second);
+
+    std::vector<txt::SessionInstance> instances =
+        txt::ListSessionInstances(root.string());
+    CHECK(instances.size() == 2);
+    CHECK(instances[0].directory == first);
+    CHECK(instances[1].directory == second);
+    CHECK(instances[0].owner.pid == 4242);
+    CHECK(instances[0].owner.host == "host-a");
+    CHECK(instances[0].owner.sequence == 100);
+    CHECK(!instances[0].legacy);
+    CHECK(!instances[0].hasManifest);
+
+    txt::SessionInfo empty;
+    CHECK(txt::SaveSession(first, empty, &error));
+    CHECK(txt::ListSessionInstances(root.string())[0].hasManifest);
+
+    // Names that are not session ids are never listed, so a stray directory
+    // cannot be restored or removed as a session.
+    fs::create_directories(root / "instances" / "Not-A-Session");
+    CHECK(txt::ListSessionInstances(root.string()).size() == 2);
+
+    // An instance without an owner file is listed but has no pid, which the UI
+    // treats as dead.
+    fs::create_directories(root / "instances" / "abcdef");
+    instances = txt::ListSessionInstances(root.string());
+    CHECK(instances.size() == 3);
+    CHECK(instances[0].directory == (root / "instances" / "abcdef").string());
+    CHECK(instances[0].owner.pid == 0);
+
+    // The pre-instance layout is listed first so its tabs keep their order.
+    {
+        std::ofstream out(root / "manifest", std::ios::binary | std::ios::trunc);
+        out << "txt-editor-session 1\nactive 0\n";
+    }
+    instances = txt::ListSessionInstances(root.string());
+    CHECK(instances.size() == 4);
+    CHECK(instances[0].legacy);
+    CHECK(instances[0].hasManifest);
+    CHECK(instances[0].directory == root.string());
+
+    CHECK(txt::RemoveSessionInstance(first, &error));
+    CHECK(!fs::exists(first));
+    CHECK(fs::exists(second));
+
+    fs::remove_all(root, ec);
+}
+
+void TestSessionInstancesAreIsolated() {
+    namespace fs = std::filesystem;
+    const fs::path root = fs::temp_directory_path() / "txt-editor-session-isolation";
+    std::error_code ec;
+    fs::remove_all(root, ec);
+
+    std::string error;
+    txt::SessionOwner owner;
+    owner.pid = 1111;
+    owner.sequence = 10;
+    std::string first;
+    std::string second;
+    CHECK(txt::CreateSessionInstance(root.string(), owner, &first, &error));
+    owner.pid = 2222;
+    owner.sequence = 20;
+    CHECK(txt::CreateSessionInstance(root.string(), owner, &second, &error));
+
+    txt::SessionInfo a;
+    txt::SessionTabInfo tab;
+    tab.id = "aaaaaa";
+    tab.path = "/tmp/a.txt";
+    tab.modified = true;
+    CHECK(txt::WriteSessionContent(first, tab.id, "A buffer", &tab.contentFile, &error));
+    a.tabs.push_back(tab);
+    CHECK(txt::SaveSession(first, a, &error));
+
+    txt::SessionInfo b;
+    txt::SessionTabInfo other;
+    other.id = "bbbbbb";
+    other.path.clear();
+    CHECK(txt::WriteSessionContent(second, other.id, "B buffer", &other.contentFile,
+                                   &error));
+    b.tabs.push_back(other);
+    CHECK(txt::SaveSession(second, b, &error));
+
+    // Rewriting one instance must not prune the other instance's snapshots:
+    // this is the bug that made a second window delete the first one's tabs.
+    CHECK(txt::SaveSession(first, a, &error));
+    CHECK(fs::exists(fs::path(second) / "tab-bbbbbb.utf8"));
+    CHECK(fs::exists(fs::path(second) / "manifest"));
+    CHECK(txt::LoadSession(second).ok);
+    CHECK(txt::LoadSession(first).ok);
+
+    CHECK(txt::ClearSession(first, &error));
+    CHECK(fs::exists(fs::path(second) / "manifest"));
+    CHECK(fs::exists(fs::path(second) / "tab-bbbbbb.utf8"));
+
+    // Removing the legacy layout must leave instance directories alone too.
+    CHECK(txt::RemoveLegacySession(root.string(), &error));
+    CHECK(fs::exists(fs::path(second) / "manifest"));
+    CHECK(fs::exists(fs::path(first) / "owner"));
+
+    fs::remove_all(root, ec);
+}
+
+void TestSessionMerge() {
+    namespace fs = std::filesystem;
+    const fs::path root = fs::temp_directory_path() / "txt-editor-session-merge";
+    std::error_code ec;
+    fs::remove_all(root, ec);
+
+    std::string error;
+    const fs::path oldDir = root / "instances" / "aaaaaaaa";
+    const fs::path newDir = root / "instances" / "bbbbbbbb";
+    const fs::path badDir = root / "instances" / "cccccccc";
+    fs::create_directories(oldDir);
+    fs::create_directories(newDir);
+    fs::create_directories(badDir);
+
+    txt::SessionInfo older;
+    txt::SessionTabInfo untitled;
+    untitled.id = "oldaaa";
+    untitled.path.clear();
+    untitled.modified = true;
+    CHECK(txt::WriteSessionContent(oldDir.string(), untitled.id, "old untitled",
+                                   &untitled.contentFile, &error));
+    older.tabs.push_back(untitled);
+
+    txt::SessionTabInfo sharedClean;
+    sharedClean.id = "oldbbb";
+    sharedClean.path = "/tmp/shared.txt";
+    sharedClean.modified = false;
+    older.tabs.push_back(sharedClean);
+
+    txt::SessionTabInfo dirty;
+    dirty.id = "oldccc";
+    dirty.path = "/tmp/dirty.txt";
+    dirty.modified = true;
+    CHECK(txt::WriteSessionContent(oldDir.string(), dirty.id, "old dirty",
+                                   &dirty.contentFile, &error));
+    older.tabs.push_back(dirty);
+    older.active = 1;
+    CHECK(txt::SaveSession(oldDir.string(), older, &error));
+
+    txt::SessionInfo newer;
+    txt::SessionTabInfo sharedDirty;
+    sharedDirty.id = "newaaa";
+    sharedDirty.path = "/tmp/shared.txt";
+    sharedDirty.modified = true;
+    CHECK(txt::WriteSessionContent(newDir.string(), sharedDirty.id, "new shared",
+                                   &sharedDirty.contentFile, &error));
+    newer.tabs.push_back(sharedDirty);
+
+    txt::SessionTabInfo dirtyAgain;
+    dirtyAgain.id = "newbbb";
+    dirtyAgain.path = "/tmp/dirty.txt";
+    dirtyAgain.modified = true;
+    CHECK(txt::WriteSessionContent(newDir.string(), dirtyAgain.id, "new dirty",
+                                   &dirtyAgain.contentFile, &error));
+    newer.tabs.push_back(dirtyAgain);
+
+    txt::SessionTabInfo fresh;
+    fresh.id = "newccc";
+    fresh.path = "/tmp/only-new.txt";
+    fresh.modified = false;
+    newer.tabs.push_back(fresh);
+    newer.active = 1;
+    CHECK(txt::SaveSession(newDir.string(), newer, &error));
+
+    {
+        std::ofstream out(badDir / "manifest", std::ios::binary | std::ios::trunc);
+        out << "txt-editor-session 1\nthis is not a session\n";
+    }
+
+    const txt::MergedSession merged =
+        txt::MergeSessions({badDir.string(), oldDir.string(), newDir.string()});
+    CHECK(merged.errors.size() == 1);
+    CHECK(merged.mergedDirectories.size() == 2);
+    CHECK(merged.session.tabs.size() == 5);
+    CHECK(merged.session.tabs[0].id == "oldaaa");  // untitled tab is kept
+    CHECK(merged.session.tabs[1].id == "newaaa");  // modified beats clean
+    CHECK(merged.session.tabs[1].path == "/tmp/shared.txt");
+    CHECK(merged.session.tabs[2].id == "oldccc");  // both modified: kept twice
+    CHECK(merged.session.tabs[3].id == "newbbb");
+    CHECK(merged.session.tabs[4].id == "newccc");
+    CHECK(merged.sourceDirectory[0] == oldDir.string());
+    CHECK(merged.sourceDirectory[1] == newDir.string());
+    CHECK(merged.sourceDirectory[2] == oldDir.string());
+    CHECK(merged.sourceDirectory[3] == newDir.string());
+    CHECK(merged.sourceDirectory[4] == newDir.string());
+    CHECK(merged.session.active == 3);  // the newest session's active tab
+
+    // Snapshots can move into the surviving instance before it is written.
+    std::string copied;
+    CHECK(txt::CopySessionContent(merged.sourceDirectory[2],
+                                  merged.session.tabs[2].contentFile, newDir.string(),
+                                  merged.session.tabs[2].id, &copied, &error));
+    CHECK(copied == "tab-oldccc.utf8");
+    std::string text;
+    CHECK(txt::ReadSessionContent(newDir.string(), copied, &text, &error));
+    CHECK(text == "old dirty");
+    const fs::perms permissions = fs::status(newDir / copied).permissions();
+    CHECK((permissions & fs::perms::owner_read) != fs::perms::none);
+    CHECK((permissions & fs::perms::owner_write) != fs::perms::none);
+    CHECK((permissions & fs::perms::group_read) == fs::perms::none);
+    CHECK((permissions & fs::perms::others_read) == fs::perms::none);
+
+    // A missing snapshot is a failure, not an empty buffer.
+    CHECK(!txt::CopySessionContent(badDir.string(), "tab-oldccc.utf8",
+                                   newDir.string(), "oldccc", &copied, &error));
+    CHECK(!error.empty());
+
+    fs::remove_all(root, ec);
+}
+
+void TestLegacySessionMigration() {
+    namespace fs = std::filesystem;
+    const fs::path root = fs::temp_directory_path() / "txt-editor-session-legacy";
+    std::error_code ec;
+    fs::remove_all(root, ec);
+    fs::create_directories(root);
+
+    std::string error;
+    txt::SessionInfo legacy;
+    txt::SessionTabInfo tab;
+    tab.id = "legacy1";
+    tab.path.clear();
+    tab.modified = true;
+    CHECK(txt::WriteSessionContent(root.string(), tab.id, "legacy text",
+                                   &tab.contentFile, &error));
+    legacy.tabs.push_back(tab);
+    CHECK(txt::SaveSession(root.string(), legacy, &error));
+
+    txt::SessionOwner owner;
+    owner.pid = 777;
+    owner.sequence = 50;
+    std::string instance;
+    CHECK(txt::CreateSessionInstance(root.string(), owner, &instance, &error));
+
+    const std::vector<txt::SessionInstance> instances =
+        txt::ListSessionInstances(root.string());
+    CHECK(instances.size() == 2);
+    CHECK(instances[0].legacy);
+    CHECK(instances[1].directory == instance);
+
+    const txt::MergedSession merged =
+        txt::MergeSessions({root.string(), instance});
+    CHECK(merged.errors.empty());
+    CHECK(merged.session.tabs.size() == 1);
+    CHECK(merged.sourceDirectory[0] == root.string());
+
+    std::string copied;
+    CHECK(txt::CopySessionContent(merged.sourceDirectory[0],
+                                  merged.session.tabs[0].contentFile, instance,
+                                  merged.session.tabs[0].id, &copied, &error));
+    std::string text;
+    CHECK(txt::ReadSessionContent(instance, copied, &text, &error));
+    CHECK(text == "legacy text");
+
+    CHECK(txt::RemoveLegacySession(root.string(), &error));
+    CHECK(!fs::exists(root / "manifest"));
+    CHECK(!fs::exists(root / "tab-legacy1.utf8"));
+    CHECK(fs::is_directory(instance));
+
+    fs::remove_all(root, ec);
+}
+
+void TestSessionTemporaries() {
+    namespace fs = std::filesystem;
+    const fs::path root = fs::temp_directory_path() / "txt-editor-session-tmp";
+    std::error_code ec;
+    fs::remove_all(root, ec);
+    fs::create_directories(root / "instances" / "aaaaaaaa");
+
+    const fs::path staleRoot = root / "tab-legacy1.utf8.tmp-1-1";
+    const fs::path freshRoot = root / "manifest.tmp-2-2";
+    const fs::path keepRoot = root / "manifest";
+    const fs::path staleInstance = root / "instances" / "aaaaaaaa" / "owner.tmp-3-3";
+    for (const fs::path& path : {staleRoot, freshRoot, keepRoot, staleInstance}) {
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        out << "x";
+    }
+    const fs::file_time_type old =
+        fs::file_time_type::clock::now() - std::chrono::hours(48);
+    fs::last_write_time(staleRoot, old, ec);
+    fs::last_write_time(staleInstance, old, ec);
+
+    std::string error;
+    CHECK(txt::CleanSessionTemporaries(root.string(), &error));
+    CHECK(!fs::exists(staleRoot));
+    CHECK(!fs::exists(staleInstance));
+    // Young temporaries may belong to a running instance.
+    CHECK(fs::exists(freshRoot));
+    CHECK(fs::exists(keepRoot));
+
+    fs::remove_all(root, ec);
+}
+
+void TestFileStamp() {
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::temp_directory_path() / "txt-editor-tests";
+    fs::create_directories(dir);
+    const fs::path path = dir / "stamp.txt";
+    std::error_code ec;
+    fs::remove(path, ec);
+    {
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        out << "first\n";
+    }
+
+    const txt::LoadResult first = txt::LoadDocument(path.string());
+    CHECK(first.ok);
+    CHECK(first.stamp.valid);
+
+    txt::FileStamp read;
+    CHECK(txt::ReadFileStamp(path.string(), &read));
+    CHECK(read.valid);
+    CHECK(txt::SameFileStamp(first.stamp, read));
+
+    std::string error;
+    CHECK(txt::SaveDocument(path.string(), "second, longer\n", first.meta, &error));
+    txt::FileStamp changed;
+    CHECK(txt::ReadFileStamp(path.string(), &changed));
+    CHECK(changed.valid);
+    CHECK(!txt::SameFileStamp(first.stamp, changed));
+
+    // Unknown stamps never look like a conflict on their own.
+    CHECK(!txt::ReadFileStamp((dir / "missing-stamp.txt").string(), &changed));
+    CHECK(!changed.valid);
+    CHECK(!txt::SameFileStamp(first.stamp, changed));
+    CHECK(!txt::SameFileStamp(txt::FileStamp{}, txt::FileStamp{}));
+
+    fs::remove_all(dir, ec);
+}
+
 std::vector<std::string_view> ViewsOf(const std::vector<std::string>& lines) {
     std::vector<std::string_view> views;
     views.reserve(lines.size());
@@ -536,6 +896,12 @@ int main() {
     TestNonAsciiPath();
     TestSessionRoundTrip();
     TestSessionCorruption();
+    TestSessionInstanceList();
+    TestSessionInstancesAreIsolated();
+    TestSessionMerge();
+    TestLegacySessionMigration();
+    TestSessionTemporaries();
+    TestFileStamp();
     TestSplitLines();
     TestDiffIdentical();
     TestDiffReplace();

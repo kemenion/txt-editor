@@ -35,9 +35,75 @@ struct SessionLoadResult {
     std::string error;
 };
 
+// Identity of one running editor process. Every process writes its recovery
+// state into its own directory, so two windows can never overwrite or prune
+// each other's snapshots. The owner file is written before the first manifest
+// and lets the next start tell crashed instances from live ones.
+struct SessionOwner {
+    long pid = 0;
+    std::string host;        // UTF-8 host name; empty when unknown
+    long long sequence = 0;  // start time in seconds since the epoch
+};
+
+struct SessionInstance {
+    std::string directory;  // absolute path of the instance directory
+    SessionOwner owner;
+    bool legacy = false;     // old layout: manifest directly in the root
+    bool hasManifest = false;
+};
+
+// Result of merging the sessions of dead instances. `sourceDirectory` is
+// parallel to `session.tabs` and names the directory that holds the snapshot;
+// it is not necessarily the directory the merged session is saved to later.
+struct MergedSession {
+    SessionInfo session;
+    std::vector<std::string> sourceDirectory;
+    std::vector<std::string> mergedDirectories;  // sources read successfully
+    std::vector<std::string> errors;
+};
+
 // Returns the XDG state directory used for the session; empty if HOME is
 // unavailable. No filesystem changes are made.
 std::string DefaultSessionDirectory();
+
+// Lists the legacy root session plus every instance below `<root>/instances`.
+// Entries are ordered oldest first; directories whose name is not a safe id
+// are ignored so a stray entry can never be restored or deleted.
+std::vector<SessionInstance> ListSessionInstances(const std::string& root);
+
+// Creates `<root>/instances/<id>`, restricts it to the owner and writes the
+// owner file. Returns the new directory.
+bool CreateSessionInstance(const std::string& root, const SessionOwner& owner,
+                           std::string* directory, std::string* error);
+
+// Rewrites the owner file atomically (0600).
+bool WriteSessionOwner(const std::string& directory, const SessionOwner& owner,
+                       std::string* error);
+
+// Reads the given sessions in order and merges their tabs by path: a modified
+// tab wins over a clean one, two modified tabs are both kept because either
+// may hold unsaved work. Malformed sessions are skipped and reported in
+// `errors`.
+MergedSession MergeSessions(const std::vector<std::string>& directories);
+
+// Copies a snapshot into another instance directory, rewriting the file name
+// for `id`. Used when an unloaded recovered tab changes owner on save.
+bool CopySessionContent(const std::string& sourceDirectory,
+                        const std::string& contentFile,
+                        const std::string& targetDirectory, const std::string& id,
+                        std::string* newContentFile, std::string* error);
+
+// Deletes one dead instance: snapshots, manifest, owner file and directory.
+// Callers must verify liveness first; live sessions must never be passed here.
+bool RemoveSessionInstance(const std::string& directory, std::string* error);
+
+// Deletes the pre-instance layout (root manifest and root snapshots) after a
+// successful migration. `instances/` is left untouched.
+bool RemoveLegacySession(const std::string& root, std::string* error);
+
+// Removes `*.tmp-*` leftovers of killed processes older than one day, both in
+// the root and in every instance directory. Best effort.
+bool CleanSessionTemporaries(const std::string& root, std::string* error);
 
 // Generates a safe identifier for a tab. The value only contains [a-z0-9].
 std::string MakeSessionId();
