@@ -33,7 +33,8 @@ discard the saved session; the editor opens a blank tab when no session exists.
 ## Quick start (no root)
 
 The host only needs `g++`, `git`, `curl`, `unzip`, `dpkg-deb`. Everything else is bootstrapped
-into `third_party/`:
+into `third_party/` (gitignored, about 1.4 GB with the wx build tree; delete it and re-run the
+scripts to rebuild):
 
 ```bash
 ./scripts/bootstrap-local-deps.sh   # CMake, Ninja, pkgconf, GTK3 dev + runtime (user space)
@@ -80,6 +81,7 @@ src/editor/   EditorWidget: wxStyledTextCtrl adapter, lexer/theme
 src/core/     pure C++20: encoding, EOL, language detection, diff, file I/O
 tests/        framework-free core tests
 scripts/      bootstrap, build, test, package, benchmark
+patches/      wxWidgets patches applied by scripts/build-wx.sh
 docs/         architecture, build, performance
 .cline/rules/ project rules for AI-assisted development
 ```

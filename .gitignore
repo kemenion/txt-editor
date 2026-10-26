@@ -67,5 +67,9 @@ vcpkg_installed/
 Testing/
 .cache/
 
+# Local build output and the bootstrapped toolchain cache: CMake/Ninja/pkgconf, the
+# Debian GTK3 sysroot, wxWidgets and its vendored Scintilla/Lexilla trees, plus wx's
+# build tree (about 1.4 GB). Never commit it; rebuild with scripts/bootstrap-local-deps.sh
+# and scripts/build-wx.sh. Local wx changes belong in patches/, not here.
 dist
 third_party

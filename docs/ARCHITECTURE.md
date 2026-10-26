@@ -11,7 +11,9 @@ The architecture optimises for:
 4. **Portability** — the same core compiles on Windows; wxSTC isolates Scintilla.
 
 wxWidgets 3.3.4 is pinned because it vendors Scintilla 5.0.0 and Lexilla 5.5.4, and includes
-the October 2026 wxGTK IME pre-edit fix. wx 3.2.x is explicitly unsupported.
+the October 2026 wxGTK IME pre-edit fix. wx 3.2.x is explicitly unsupported. 3.3.4 still hands
+wxSTC's caret rectangle to GTK with a zero width, which wxGTK discards, so `patches/` carries
+`wx-3.3.4-ime-caret-rect.patch`; `scripts/build-wx.sh` applies it.
 
 ## 2. Layers
 
@@ -251,11 +253,9 @@ scrolls. `F11` dark-mode changes are propagated with `SetDarkMode`.
 
 Profiling marks (`TXT_EDITOR_PROFILE=1`) print `t=…ms` to stderr at:
 
-- `app.init.begin`, `app.init.end`;
-- `frame.created`, `frame.shown`;
-- `file.load.begin/end`;
+- `process main`, `OnInit begin`, `window shown`;
 - `session restore begin/none/failed/done`, `session tab load begin/loaded`;
-- `editor.first_idle`.
+- `load begin`, `load done` (byte count).
 
 M0 loads files on the UI thread. The 100 MB budget is met by avoiding lexer/undo and by using
 raw UTF-8 transfer; if a profile shows a stall, move `Document::Load` to a worker and deliver the
@@ -265,7 +265,9 @@ buffer via `CallAfter`. The core API is already thread-agnostic.
 
 - Wayland and X11 are both supported through wxGTK3; no direct Wayland protocol code.
 - fcitx5 via GTK IM module. The editor does not consume `wxEVT_CHAR`/key events for printable
-  input; only standard accelerators are bound.
+  input; only standard accelerators are bound. The input method is told where the caret is through
+  `wxWindow::UpdateInputMethodCursorRect()`; the local wx patch (§8) keeps that rectangle
+  non-empty, which is what positions the candidate window.
 - Dark title bar on Windows is a future `DwmSetWindowAttribute` call; Linux uses the system theme.
 - `StartupWMClass=txt-editor` in the desktop file keeps the KDE task manager association.
 - AppImage is a single-file distribution; GTK3 remains a host dependency.
@@ -282,6 +284,7 @@ buffer via `CallAfter`. The core API is already thread-agnostic.
 | Session snapshots in user state dir | Restores unsaved work without scanning or touching source files; owner-only files and lazy loading keep startup and privacy bounded. |
 | UTF-16 without BOM treated as UTF-8/Latin-1 | Avoid false positives; documented limitation. |
 | Latin-1 lossy save | Rare legacy path; visible warning could be added later. |
+| Local patch for the IME caret rectangle | wx 3.3.4 reports a zero-width caret rect and wxGTK drops it. Two patched call sites beat an `OnUpdateUI` workaround, which wxSTC overwrites on every caret move. Drop the patch when upstream fixes it. |
 
 ## 9. Future Windows port
 

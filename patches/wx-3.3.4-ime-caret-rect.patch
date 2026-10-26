@@ -1,0 +1,43 @@
+# wxWidgets 3.3.4: hand the input method a usable caret rectangle.
+#
+# wxSTC described the caret with a zero-width rectangle and wxGTK discarded any
+# empty rectangle in wxWindowGTK::GTKUpdateIMCursorRect(), so
+# gtk_im_context_set_cursor_location() was never called and fcitx5 placed the
+# candidate window at its default position instead of next to the caret.
+# Both sides are fixed here; apply from third_party/wx-src with -p1.
+#
+# Target: wxWidgets 3.3.4 (Scintilla 5.0.0, Lexilla 5.5.4).
+--- a/src/stc/ScintillaWX.cpp
++++ b/src/stc/ScintillaWX.cpp
+@@ -1432,10 +1432,13 @@
+ wxRect ScintillaWX::GetIMEContextRect()
+ {
+     const Point pt = PointMainCaret();
++    // A caret is a line, not a box: wxGTK drops rectangles with a zero width,
++    // which would leave the input method windows unpositioned. Keep it at 1px.
++    const int caretWidth = std::max(1, vs.caretWidth);
+     // Keep the candidate window from overlapping the current line.
+     return wxRect(static_cast<int>(pt.x),
+                   static_cast<int>(pt.y + std::max(4, vs.lineHeight / 4)),
+-                  0, vs.lineHeight);
++                  caretWidth, std::max(1, vs.lineHeight));
+ }
+ 
+ #endif // __WXGTK__
+--- a/src/gtk/window.cpp
++++ b/src/gtk/window.cpp
+@@ -1582,10 +1582,12 @@
+ void wxWindowGTK::GTKUpdateIMCursorRect(GtkIMContext* imContext) const
+ {
+     const wxRect rect = GetInputMethodCursorRect();
+-    if ( rect.IsEmpty() )
++    // A caret may legitimately be described by a zero-width rectangle, so only
++    // a missing height means "no position". GTK gets a 1px wide caret area.
++    if ( rect.height <= 0 )
+         return;
+ 
+-    GdkRectangle area = { rect.x, rect.y, rect.width, rect.height };
++    GdkRectangle area = { rect.x, rect.y, wxMax(rect.width, 1), rect.height };
+     gtk_im_context_set_cursor_location(imContext, &area);
+ }
+ 

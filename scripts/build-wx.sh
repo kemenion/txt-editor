@@ -65,8 +65,29 @@ ensure_submodule() {
     tar -xzf "$archive" -C "$path" --strip-components=1
 }
 
+# Apply the local patches in patches/ on top of the pristine upstream tree.
+# Idempotent: a patch counts as applied when it can be reversed cleanly. Uses
+# git apply, which needs no extra host tool and works outside a repository.
+apply_patches() {
+    local patch_file name
+    for patch_file in "$ROOT"/patches/wx-"$WX_VERSION"-*.patch; do
+        [[ -f "$patch_file" ]] || continue
+        name="$(basename "$patch_file")"
+        if ( cd "$WX_SRC" && git apply --reverse --check "$patch_file" ) >/dev/null 2>&1; then
+            echo "[wx] patch already applied: $name"
+        elif ( cd "$WX_SRC" && git apply "$patch_file" ); then
+            echo "[wx] applied patch: $name"
+        else
+            echo "[wx] ERROR: $name does not apply to $WX_SRC" >&2
+            echo "[wx] Delete third_party/wx-src and re-run, or rebase the patch." >&2
+            return 1
+        fi
+    done
+}
+
 ensure_submodule "$WX_SRC/src/stc/scintilla" "$SCINTILLA_COMMIT" scintilla 500
 ensure_submodule "$WX_SRC/src/stc/lexilla" "$LEXILLA_COMMIT" lexilla 554
+apply_patches
 
 # Rebuild if the previous install/build tree came from another wx release.
 for dir in "$WX_BUILD" "$WX_PREFIX"; do
