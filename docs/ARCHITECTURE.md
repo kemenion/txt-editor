@@ -79,6 +79,7 @@ struct LoadResult {
     bool ok = false;
     std::string utf8;
     DocumentMeta meta;
+    FileStamp stamp;
     std::string error;
 };
 
@@ -94,6 +95,12 @@ bool Save(const std::string& path, std::string_view utf8,
   over the target. A failed save leaves the original untouched.
 - No exceptions cross the core boundary.
 
+`LoadDocument` also records a `FileStamp` (size and modification time, `ReadFileStamp`). Before a
+save the UI compares the stored stamp with the file on disk; if they differ the file changed under
+the tab and the user chooses Reload / Overwrite / Cancel instead of silently replacing it. A stamp
+that cannot be read is `valid=false` and never triggers the prompt, and a recovered snapshot has no
+stamp until its first save, so an unknown state never blocks the user.
+
 ### 3.5 Session persistence
 
 `core/Session.*` is wx-free and owns the on-disk recovery format. The UI only supplies a
@@ -102,13 +109,29 @@ bool Save(const std::string& path, std::string_view utf8,
 Location: `$XDG_STATE_HOME/txt-editor/session`, or
 `~/.local/state/txt-editor/session`; directory mode `0700`, snapshot files `0600`.
 
-Files:
+Every window owns one instance directory, so two windows (or a window and a crashed predecessor)
+never write the same file:
 
+```
+session/instances/<id>/owner
+session/instances/<id>/manifest
+session/instances/<id>/tab-<id>.utf8
+```
+
+- `owner` — `txt-editor-instance 1`, `pid`, hex-encoded host name and start sequence. It is
+  written before the first manifest so a later start can tell a crashed session from a live one.
+  PIDs are reused by the kernel; a reused PID only makes the restore skip that session, it never
+  deletes data.
 - `manifest` — a small text file: `txt-editor-session 1`, `active <index>`, then one
   `tab ...` line per tab. Paths are hex-encoded UTF-8 so spaces, newlines and non-ASCII names
   round-trip without escaping rules.
 - `tab-<id>.utf8` — UTF-8 recovery text. Written only when a tab is untitled or modified.
   Clean named tabs reference the real file and keep no snapshot.
+
+The pre-instance layout (`manifest` and snapshots directly in the session root) is still read and
+migrated on the next clean close; `RemoveLegacySession` then deletes it without touching
+`instances/`. `ListSessionInstances` ignores directory names that are not safe ids, so a stray
+entry can never be restored or deleted.
 
 Each tab line records id, path, modified flag, encoding, EOL, language, large-file flag,
 selection anchor/caret, first visible line, zoom and content-file name. Ids are random,
@@ -119,15 +142,34 @@ Write and read rules:
 
 - `WriteSessionContent` writes the snapshot atomically (temp file, flush, rename).
 - `SaveSession` validates every reference first, writes the manifest atomically, and only then
-  removes snapshot files that the new manifest does not reference.
+  removes snapshot files that the new manifest does not reference. It only ever sees its own
+  instance directory, which is what makes concurrent windows safe.
 - `LoadSession` validates the header, every numeric field, id uniqueness and the existence of
   every referenced snapshot. A malformed session is reported as a whole and is not partially
   restored.
 - The UI restores tabs lazily: only the active tab is read during restore. Selecting another
   tab loads it through the same `LoadText` path and re-applies the stored view state.
+
+Startup merge and shutdown:
+
+- On the first `CallAfter` tick the window claims a new instance directory
+  (`CreateSessionInstance`), lists every instance and merges the sessions whose process is gone
+  (`wxProcess::Exists` on the same host; liveness stays in the wx layer). Live instances are left
+  alone, and sessions from another host sharing the same home directory are neither restored nor
+  deleted.
+- `MergeSessions` reads oldest first and dedupes by path: a modified tab beats a clean one, two
+  modified tabs for the same path are both kept so neither buffer is dropped, and untitled tabs
+  are always kept. The merged session is capped at 200 tabs; skipped sources are reported in the
+  status bar and left on disk rather than deleted.
+- A restored tab reads its snapshot from the instance that owned it until the next close, when
+  `CopySessionContent` moves surviving buffers into the new instance and `SaveSession` writes the
+  manifest. The merged directories are removed only after that manifest exists, so a crash in
+  between never loses the recovered text.
 - On clean close the session is persisted before the window is allowed to close. If persistence
-  fails, the UI falls back to the normal Save/Discard/Cancel prompt and removes the stale
-  session so an older buffer is never restored over newer files.
+  fails, the UI falls back to the normal Save/Discard/Cancel prompt and removes its own directory
+  plus the merged ones so an older buffer is never restored over newer files.
+- `CleanSessionTemporaries` removes `*.tmp-*` files older than a day at startup; younger files may
+  belong to a window that is writing right now.
 
 ## 4. Editor adapter
 
@@ -282,6 +324,8 @@ buffer via `CallAfter`. The core API is already thread-agnostic.
 | Owner-drawn `TabBook` | GTK `wxNotebook` has no per-tab close button; AUI would add a module and docking complexity. |
 | No background file I/O in M0 | Simpler; budgets are achievable with large-file mode. Revisit after measurements. |
 | Session snapshots in user state dir | Restores unsaved work without scanning or touching source files; owner-only files and lazy loading keep startup and privacy bounded. |
+| One session directory per window | Two windows used to prune each other's snapshots through a shared manifest; per-instance state plus a startup merge keeps every window's recovery data without file locking. |
+| Size + mtime check before save | Catches another window or editor rewriting the tab's file without inotify or background I/O; a same-size rewrite inside one mtime tick can still slip through. |
 | UTF-16 without BOM treated as UTF-8/Latin-1 | Avoid false positives; documented limitation. |
 | Latin-1 lossy save | Rare legacy path; visible warning could be added later. |
 | Local patch for the IME caret rectangle | wx 3.3.4 reports a zero-width caret rect and wxGTK drops it. Two patched call sites beat an `OnUpdateUI` workaround, which wxSTC overwrites on every caret move. Drop the patch when upstream fixes it. |

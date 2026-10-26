@@ -5,6 +5,7 @@
 
 #include <wx/frame.h>
 
+#include "core/TextTypes.h"
 #include "ui/CompareTypes.h"
 #include "ui/TabBook.h"
 
@@ -14,7 +15,6 @@ class wxUpdateUIEvent;
 
 namespace txt {
 
-struct DocumentMeta;
 class CompareFrame;
 class EditorWidget;
 class FindPanel;
@@ -32,6 +32,11 @@ private:
     struct TabState {
         std::string id;
         std::string contentFile;
+        // Directory that owns contentFile. Empty means this window's own
+        // instance directory; a restored tab first points at its source.
+        std::string contentDirectory;
+        // File identity at load/save time; invalid when it cannot be checked.
+        FileStamp stamp;
         std::string loadError;
         bool loaded = true;
         bool recoveredModified = false;
@@ -49,12 +54,16 @@ private:
     const TabState* StateAt(int index) const;
 
     void CreatePage(const std::string& utf8, const DocumentMeta& meta,
-                    const std::string& path);
+                    const std::string& path, const FileStamp& stamp);
     void AppendPage(EditorWidget* editor, const wxString& title, TabState state);
     void DeletePage(int index);
     bool EnsureTabLoaded(int index);
+    bool ReloadTabFromDisk(int index);
     void CaptureViewState(EditorWidget* editor, TabState& state) const;
+    bool EnsureSessionInstance(std::string* error);
     bool PersistSessionForRestart(std::string* error);
+    void RemoveRestoredSessions();
+    void DiscardSessionState();
     void ShowFindPanel(bool show, bool replace);
     bool MaybeSave(EditorWidget* editor);
     bool MaybeSaveAll();
@@ -116,7 +125,11 @@ private:
     wxMenuItem* m_wrapItem = nullptr;
     std::vector<EditorWidget*> m_pages;
     std::vector<TabState> m_tabStates;
-    std::string m_sessionDirectory;
+    std::string m_sessionRoot;
+    std::string m_instanceDirectory;
+    // Session directories merged into this window at start; removed once their
+    // tabs are persisted here.
+    std::vector<std::string> m_restoredDirectories;
     bool m_suppressPageChanged = false;
     bool m_dark = false;
     bool m_wordWrap = false;

@@ -11,7 +11,10 @@ second target from the same codebase.
 
 - Tabs with per-tab close buttons, new/open/save/save-as, and a three-way
   Save / Don't Save / Cancel prompt for unsaved changes.
-- Session restore across restarts: tab order, active tab, view state, and unsaved recovery buffers.
+- Session restore across restarts: tab order, active tab, view state, and unsaved recovery buffers;
+  several windows can run at once and the sessions of closed windows are merged on the next start.
+- Save-time conflict check: a file changed on disk since it was opened can be reloaded or
+  overwritten explicitly instead of being replaced silently.
 - Line numbers, current-line highlight, brace matching, folding (normal files only).
 - UTF-8, UTF-8 BOM, UTF-16LE/BE and Latin-1 detection; original encoding preserved on save.
 - LF / CRLF / CR detection and preservation.
@@ -27,8 +30,15 @@ Not in M0: plugins, LSP, split view, minimap, telemetry, multi-cursor.
 
 Session recovery data is local only, stored with owner-only permissions under
 `$XDG_STATE_HOME/txt-editor/session` (falling back to
-`~/.local/state/txt-editor/session`). It is never sent anywhere. Delete that directory to
-discard the saved session; the editor opens a blank tab when no session exists.
+`~/.local/state/txt-editor/session`). Each window keeps its own directory below
+`session/instances/`, so several windows can run at the same time without overwriting or pruning
+each other's recovery buffers; the next start merges the sessions of windows that are gone. It is
+never sent anywhere. Delete that directory to discard the saved session; the editor opens a blank
+tab when no session exists.
+
+Saving compares the file's size and modification time with the moment it was loaded. If another
+program changed the file in the meantime, the editor asks whether to reload it or to overwrite it
+instead of replacing it silently.
 
 ## Quick start (no root)
 

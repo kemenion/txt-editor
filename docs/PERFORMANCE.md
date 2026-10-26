@@ -74,6 +74,11 @@ not being decoded twice and that lexer/undo are disabled above 32 MiB.
 - [ ] Find next/previous wraps; match case and whole word behave.
 - [ ] Replace one/all; undo restores the original.
 - [ ] Close a modified tab; Save/Discard/Cancel all behave.
+- [ ] Open a file, change it in another editor, then `Ctrl+S`: the Reload / Overwrite / Cancel
+      prompt appears; Reload shows the other editor's text, Overwrite keeps the tab's text.
+- [ ] Run two windows at once (`XDG_STATE_HOME=/tmp/txt-state-1 ./build/txt-editor`), leave
+      unsaved text in both, close both, start once more: both sets of tabs are restored, no
+      duplicates and no lost buffer.
 - [ ] Drag a file onto the window (if implemented) or open via dialog and CLI.
 - [ ] `Ctrl+Q` with modified tabs prompts.
 

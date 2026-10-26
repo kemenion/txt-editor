@@ -1,6 +1,7 @@
 #include "ui/MainFrame.h"
 
 #include <algorithm>
+#include <ctime>
 #include <filesystem>
 #include <string>
 #include <utility>
@@ -13,8 +14,10 @@
 #include <wx/filename.h>
 #include <wx/menu.h>
 #include <wx/msgdlg.h>
+#include <wx/process.h>
 #include <wx/sizer.h>
 #include <wx/statusbr.h>
+#include <wx/utils.h>
 
 #include "app/Profile.h"
 #include "core/Document.h"
@@ -46,6 +49,20 @@ wxString FileNameOf(const std::string& path) {
     return wxFileName(wxString::FromUTF8(path)).GetFullName();
 }
 
+// Liveness is a process question, so it stays in the wx layer; core only
+// records who owns an instance directory.
+bool IsInstanceAlive(const SessionInstance& instance) {
+    if (instance.owner.pid <= 0) return false;
+
+    const std::string host = wxGetHostName().utf8_string();
+    if (!instance.owner.host.empty() && instance.owner.host != host) {
+        // Another machine sharing this home directory: neither restore nor
+        // delete its state, so a slow NFS home cannot lose unsaved work here.
+        return true;
+    }
+    return wxProcess::Exists(static_cast<int>(instance.owner.pid));
+}
+
 }  // namespace
 
 MainFrame::MainFrame()
@@ -75,7 +92,6 @@ MainFrame::MainFrame()
     if (m_themeItem) m_themeItem->Check(m_dark);
     if (m_wrapItem) m_wrapItem->Check(m_wordWrap);
     if (m_fileHistory && config) m_fileHistory->Load(*config);
-    m_sessionDirectory = DefaultSessionDirectory();
 
     Bind(wxEVT_MENU, &MainFrame::OnNew, this, wxID_NEW);
     Bind(wxEVT_MENU, &MainFrame::OnOpen, this, wxID_OPEN);
@@ -233,7 +249,7 @@ void MainFrame::DeletePage(int index) {
 }
 
 void MainFrame::CreatePage(const std::string& utf8, const DocumentMeta& meta,
-                           const std::string& path) {
+                           const std::string& path, const FileStamp& stamp) {
     // Reuse the pristine "Untitled" page when the first real file is opened:
     // launching with a file should not leave an extra empty tab behind.
     if (!path.empty() && m_pages.size() == 1) {
@@ -252,6 +268,7 @@ void MainFrame::CreatePage(const std::string& utf8, const DocumentMeta& meta,
     TabState state;
     state.id = MakeSessionId();
     state.loaded = true;
+    state.stamp = stamp;
     AppendPage(editor, FileNameOf(path), std::move(state));
     UpdateTitle();
     UpdateStatus();
@@ -283,7 +300,7 @@ bool MainFrame::OpenPath(const std::string& path, bool quiet) {
         return false;
     }
     profile::MarkBytes("load done", loaded.utf8.size());
-    CreatePage(loaded.utf8, loaded.meta, normalized);
+    CreatePage(loaded.utf8, loaded.meta, normalized, loaded.stamp);
     m_fileHistory->AddFileToHistory(wxString::FromUTF8(normalized));
     if (!loaded.error.empty()) {
         SetStatusText(wxString::FromUTF8(loaded.error), 0);
@@ -293,7 +310,7 @@ bool MainFrame::OpenPath(const std::string& path, bool quiet) {
 
 void MainFrame::NewDocument() {
     DocumentMeta meta;
-    CreatePage(std::string(), meta, std::string());
+    CreatePage(std::string(), meta, std::string(), FileStamp{});
 }
 
 bool MainFrame::EnsureTabLoaded(int index) {
@@ -306,10 +323,14 @@ bool MainFrame::EnsureTabLoaded(int index) {
     std::string utf8;
     std::string error;
     DocumentMeta meta = editor->Meta();
+    FileStamp stamp;
 
     if (!state->contentFile.empty()) {
-        if (m_sessionDirectory.empty() ||
-            !ReadSessionContent(m_sessionDirectory, state->contentFile, &utf8, &error)) {
+        const std::string directory = state->contentDirectory.empty()
+                                          ? m_instanceDirectory
+                                          : state->contentDirectory;
+        if (directory.empty() ||
+            !ReadSessionContent(directory, state->contentFile, &utf8, &error)) {
             if (error.empty()) error = "Session directory is not available.";
         }
     } else if (!editor->Path().empty()) {
@@ -318,6 +339,7 @@ bool MainFrame::EnsureTabLoaded(int index) {
         if (loaded.ok) {
             utf8 = loaded.utf8;
             meta = loaded.meta;
+            stamp = loaded.stamp;
         } else {
             error = loaded.error;
         }
@@ -334,6 +356,7 @@ bool MainFrame::EnsureTabLoaded(int index) {
 
     state->loaded = true;
     state->loadError.clear();
+    state->stamp = stamp;
     editor->LoadText(utf8, meta);
     if (state->recoveredModified) editor->MarkRecoveredUnsaved();
     editor->RestoreViewState(state->anchor, state->caret, state->firstVisibleLine,
@@ -355,13 +378,32 @@ void MainFrame::CaptureViewState(EditorWidget* editor, TabState& state) const {
     state.zoom = editor->GetZoom();
 }
 
-bool MainFrame::PersistSessionForRestart(std::string* error) {
-    const std::string directory =
-        m_sessionDirectory.empty() ? DefaultSessionDirectory() : m_sessionDirectory;
-    if (directory.empty()) {
+bool MainFrame::EnsureSessionInstance(std::string* error) {
+    if (!m_instanceDirectory.empty()) return true;
+    if (m_sessionRoot.empty()) m_sessionRoot = DefaultSessionDirectory();
+    if (m_sessionRoot.empty()) {
         if (error) *error = "Cannot determine the session directory.";
         return false;
     }
+
+    // The sequence orders instances from oldest to newest, so the next start
+    // merges tabs in the order the windows were opened.
+    SessionOwner owner;
+    owner.pid = static_cast<long>(wxGetProcessId());
+    owner.host = wxGetHostName().utf8_string();
+    owner.sequence = static_cast<long long>(std::time(nullptr));
+
+    std::string directory;
+    if (!CreateSessionInstance(m_sessionRoot, owner, &directory, error)) {
+        return false;
+    }
+    m_instanceDirectory = directory;
+    return true;
+}
+
+bool MainFrame::PersistSessionForRestart(std::string* error) {
+    if (!EnsureSessionInstance(error)) return false;
+    const std::string directory = m_instanceDirectory;
 
     SessionInfo info;
     const int current = m_notebook ? m_notebook->GetSelection() : wxNOT_FOUND;
@@ -377,24 +419,41 @@ bool MainFrame::PersistSessionForRestart(std::string* error) {
         tab.path = editor->Path();
         tab.meta = editor->Meta();
         tab.modified = state.loaded ? editor->IsModified() : state.recoveredModified;
+        const bool needsContent = tab.path.empty() || tab.modified;
 
         if (state.loaded) {
             state.recoveredModified = tab.modified;
             CaptureViewState(editor, state);
-            if (tab.path.empty() || tab.modified) {
+            if (needsContent) {
                 if (!WriteSessionContent(directory, state.id, editor->GetUtf8(),
                                          &state.contentFile, error)) {
                     return false;
                 }
+                state.contentDirectory = directory;
             } else {
                 state.contentFile.clear();
+                state.contentDirectory.clear();
             }
         } else {
-            if ((tab.path.empty() || tab.modified) && state.contentFile.empty()) {
+            if (needsContent && state.contentFile.empty()) {
                 if (error) *error = "An unloaded tab has no recovery snapshot.";
                 return false;
             }
-            if (!tab.path.empty() && !tab.modified) state.contentFile.clear();
+            if (!needsContent) {
+                state.contentFile.clear();
+                state.contentDirectory.clear();
+            } else if (!state.contentDirectory.empty() &&
+                       state.contentDirectory != directory) {
+                // The snapshot still belongs to a dead instance; it moves here
+                // when the manifest below is written.
+                std::string moved;
+                if (!CopySessionContent(state.contentDirectory, state.contentFile,
+                                        directory, state.id, &moved, error)) {
+                    return false;
+                }
+                state.contentFile = moved;
+                state.contentDirectory = directory;
+            }
         }
 
         tab.anchor = state.anchor;
@@ -406,26 +465,83 @@ bool MainFrame::PersistSessionForRestart(std::string* error) {
     }
 
     if (!SaveSession(directory, info, error)) return false;
-    m_sessionDirectory = directory;
+    // Only now, with a complete manifest of our own, may the merged sessions
+    // disappear: until this point they are the only copy of the recovered text.
+    RemoveRestoredSessions();
     return true;
 }
 
-void MainFrame::RestoreSession() {
-    if (m_sessionDirectory.empty()) m_sessionDirectory = DefaultSessionDirectory();
-    if (m_sessionDirectory.empty()) return;
+void MainFrame::RemoveRestoredSessions() {
+    if (m_restoredDirectories.empty()) return;
 
-    profile::Mark("session restore begin");
-    const SessionLoadResult result = LoadSession(m_sessionDirectory);
-    if (!result.found) {
-        profile::Mark("session restore none");
-        return;
+    for (const SessionInstance& instance : ListSessionInstances(m_sessionRoot)) {
+        const auto found = std::find(m_restoredDirectories.begin(),
+                                     m_restoredDirectories.end(),
+                                     instance.directory);
+        if (found == m_restoredDirectories.end()) continue;
+        // Liveness is checked again: a session could have been restarted while
+        // this window was open, and a live session must never be deleted.
+        if (IsInstanceAlive(instance)) continue;
+        if (instance.legacy) {
+            RemoveLegacySession(m_sessionRoot, nullptr);
+        } else {
+            RemoveSessionInstance(instance.directory, nullptr);
+        }
     }
-    if (!result.ok) {
-        SetStatusText(wxString::FromUTF8("Session restore failed: " + result.error), 0);
+    m_restoredDirectories.clear();
+}
+
+void MainFrame::DiscardSessionState() {
+    RemoveRestoredSessions();
+    if (!m_instanceDirectory.empty()) {
+        RemoveSessionInstance(m_instanceDirectory, nullptr);
+        m_instanceDirectory.clear();
+    }
+}
+
+void MainFrame::RestoreSession() {
+    std::string instanceError;
+    if (!EnsureSessionInstance(&instanceError)) {
+        SetStatusText(wxString::FromUTF8("Session disabled: " + instanceError), 0);
         profile::Mark("session restore failed");
         return;
     }
-    if (result.session.tabs.empty()) return;
+
+    profile::Mark("session restore begin");
+    // Leftovers of killed processes are never referenced by a manifest.
+    CleanSessionTemporaries(m_sessionRoot, nullptr);
+
+    std::vector<std::string> dead;
+    for (const SessionInstance& instance : ListSessionInstances(m_sessionRoot)) {
+        if (instance.directory == m_instanceDirectory) continue;
+        if (IsInstanceAlive(instance)) continue;
+        if (!instance.hasManifest) {
+            // Crash between writing a snapshot and its manifest: there is no
+            // index to restore from, so the orphaned files can go.
+            if (!instance.legacy) {
+                RemoveSessionInstance(instance.directory, nullptr);
+            }
+            continue;
+        }
+        dead.push_back(instance.directory);
+    }
+    if (dead.empty()) {
+        profile::Mark("session restore none");
+        return;
+    }
+
+    const MergedSession merged = MergeSessions(dead);
+    if (merged.session.tabs.empty()) {
+        wxString warning;
+        for (const std::string& mergeError : merged.errors) {
+            warning += wxString::FromUTF8(mergeError) + "\n";
+        }
+        if (!warning.empty()) {
+            SetStatusText("Session restore failed: " + warning, 0);
+        }
+        profile::Mark("session restore failed");
+        return;
+    }
 
     m_suppressPageChanged = true;
     while (!m_pages.empty()) {
@@ -435,7 +551,8 @@ void MainFrame::RestoreSession() {
         m_tabStates.pop_back();
     }
 
-    for (const SessionTabInfo& tab : result.session.tabs) {
+    for (std::size_t i = 0; i < merged.session.tabs.size(); ++i) {
+        const SessionTabInfo& tab = merged.session.tabs[i];
         auto* editor = new EditorWidget(m_notebook->PageParent());
         editor->SetDarkMode(m_dark);
         editor->SetWordWrap(m_wordWrap);
@@ -445,6 +562,9 @@ void MainFrame::RestoreSession() {
         TabState state;
         state.id = tab.id;
         state.contentFile = tab.contentFile;
+        // Lazy tabs are read from the instance that owned them until the next
+        // close moves them into this window's directory.
+        state.contentDirectory = merged.sourceDirectory[i];
         state.loaded = false;
         state.recoveredModified = tab.modified;
         state.anchor = tab.anchor;
@@ -461,7 +581,9 @@ void MainFrame::RestoreSession() {
         BindEditor(editor);
     }
 
-    const int active = std::clamp(result.session.active, 0,
+    m_restoredDirectories = merged.mergedDirectories;
+
+    const int active = std::clamp(merged.session.active, 0,
                                   static_cast<int>(m_pages.size()) - 1);
     m_notebook->SetSelection(static_cast<std::size_t>(active));
     m_suppressPageChanged = false;
@@ -469,7 +591,47 @@ void MainFrame::RestoreSession() {
     EnsureTabLoaded(active);
     UpdateTitle();
     UpdateStatus();
+    if (!merged.errors.empty()) {
+        wxString warning;
+        for (const std::string& mergeError : merged.errors) {
+            warning += wxString::FromUTF8(mergeError) + "\n";
+        }
+        SetStatusText("Session restore: " + warning, 0);
+    }
     profile::Mark("session restore done");
+}
+
+bool MainFrame::ReloadTabFromDisk(int index) {
+    EditorWidget* editor = index >= 0 && index < static_cast<int>(m_pages.size())
+                               ? m_pages[static_cast<std::size_t>(index)]
+                               : nullptr;
+    if (editor == nullptr || editor->Path().empty()) return false;
+
+    const LoadResult loaded = LoadDocument(editor->Path());
+    if (!loaded.ok) {
+        wxMessageBox("Could not reload the file:\n\n" +
+                         wxString::FromUTF8(loaded.error),
+                     "Reload failed", wxOK | wxICON_ERROR, this);
+        return false;
+    }
+
+    if (TabState* state = StateAt(index)) {
+        state->loaded = true;
+        state->loadError.clear();
+        state->stamp = loaded.stamp;
+        state->recoveredModified = false;
+        state->contentFile.clear();
+        state->contentDirectory.clear();
+    }
+    editor->LoadText(loaded.utf8, loaded.meta);
+    if (m_compareFrame != nullptr) m_compareFrame->MarkStale();
+    RefreshTab(editor);
+    UpdateTitle();
+    UpdateStatus();
+    if (!loaded.error.empty()) {
+        SetStatusText(wxString::FromUTF8(loaded.error), 0);
+    }
+    return true;
 }
 
 void MainFrame::RefreshTab(EditorWidget* editor) {
@@ -616,6 +778,29 @@ bool MainFrame::SaveCurrent(bool saveAs) {
         if (path.empty()) return false;
     }
 
+    TabState* state = StateAt(editorIndex);
+    // Saving must not silently replace a file that another program (or another
+    // txt-editor window) rewrote after this tab was loaded.
+    if (!saveAs && state != nullptr && state->stamp.valid) {
+        FileStamp onDisk;
+        const bool inspected = ReadFileStamp(path, &onDisk);
+        if (inspected && onDisk.valid && !SameFileStamp(state->stamp, onDisk)) {
+            wxMessageDialog dialog(
+                this,
+                "This file changed on disk since it was opened:\n\n" +
+                    wxString::FromUTF8(path) +
+                    "\n\nReload it from disk, or overwrite it with the contents of "
+                    "this tab?",
+                "File changed on disk", wxYES_NO | wxCANCEL | wxICON_WARNING);
+            dialog.SetYesNoCancelLabels("Reload from Disk", "Overwrite", "Cancel");
+            const int choice = dialog.ShowModal();
+            if (choice == wxID_CANCEL || choice == wxID_CLOSE) return false;
+            // Reloading replaces the buffer, so the tab is no longer modified
+            // and the pending save is unnecessary.
+            if (choice == wxID_YES) return ReloadTabFromDisk(editorIndex);
+        }
+    }
+
     std::string error;
     if (!SaveDocument(path, editor->GetUtf8(), editor->Meta(), &error)) {
         wxMessageBox(wxString::FromUTF8(error), "Save failed", wxOK | wxICON_ERROR, this);
@@ -624,10 +809,13 @@ bool MainFrame::SaveCurrent(bool saveAs) {
 
     editor->SetPath(path);
     editor->MarkSaved();
-    if (TabState* state = StateAt(PageIndex(editor))) {
+    if (state != nullptr) {
         state->recoveredModified = false;
         state->contentFile.clear();
+        state->contentDirectory.clear();
         state->loadError.clear();
+        // Remember what was written, so the next save compares against it.
+        ReadFileStamp(path, &state->stamp);
     }
     m_fileHistory->AddFileToHistory(wxString::FromUTF8(path.c_str()));
     RefreshTab(editor);
@@ -1122,10 +1310,7 @@ void MainFrame::OnClose(wxCloseEvent& event) {
         }
         // Never restore a stale session after the user saved or discarded the
         // tabs explicitly.
-        std::string ignored;
-        ClearSession(m_sessionDirectory.empty() ? DefaultSessionDirectory()
-                                                : m_sessionDirectory,
-                     &ignored);
+        DiscardSessionState();
     }
     if (m_fileHistory) {
         if (wxConfigBase* config = wxConfigBase::Get()) {
